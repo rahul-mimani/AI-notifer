@@ -1,171 +1,149 @@
-Create a new file src/parser/HttpCallSiteExtractor.ts that extracts consumer-side outbound HTTP call sites from Java source using web-tree-sitter. Types are defined in src/types.ts (currently open) — import HttpCallSite and UsedField and produce values conforming to them exactly. Follow the same code style, error handling, and tree-walking approach as src/parser/RestExtractor.ts and src/parser/BeanExtractor.ts (both open).
+Create a new file src/store/StoreWriter.ts that writes a repo's manifest to a store.md file, preserving human-written prose across regenerations and refusing to overwrite uncommitted changes without an explicit force flag. Types are defined in src/types.ts (currently open) — import StoreManifest from there.
 Class shape:
-Export a class HttpCallSiteExtractor with:
+Export a class StoreWriter with:
 
-Constructor: constructor(parser: Parser). Store the parser as a private field.
-Method: extract(sourceCode: string, filePath: string): HttpCallSite[] — synchronous. Never throws; on any error return [].
+Constructor: no arguments.
+Method: async write(manifest: StoreManifest, prosePreserved: string | null, repoRoot: string, options?: { force?: boolean }): Promise<void> — writes ${repoRoot}/store.md. Throws only on the specific StoreMdHasUncommittedChanges case (see below).
 
 Imports:
-typescriptimport { Parser, Node as SyntaxNode } from 'web-tree-sitter';
-import { HttpCallSite, UsedField } from '../types';
+typescriptimport * as fs from 'fs/promises';
+import * as path from 'path';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import * as yaml from 'yaml';
+import { StoreManifest } from '../types';
 
-Detection: three HTTP client patterns
-Detect and emit one HttpCallSite per matching call. The three patterns are handled separately.
-Pattern A — RestTemplate method calls
-Match method_invocation nodes where:
+const execFileAsync = promisify(execFile);
 
-The object field is an identifier whose declared type is RestTemplate, OR the identifier name equals restTemplate (case-insensitive contains resttemplate) as a fallback heuristic when type info isn't easily resolvable.
-The name field is one of: getForObject, getForEntity, postForObject, postForEntity, exchange, put, delete.
+File format
+The output file ${repoRoot}/store.md must have exactly this structure, with the exact marker strings shown:
+# store.md — <manifest.repo>
 
-For each match, extract:
+<!-- BEGIN AI-PROSE -->
+<prose content>
+<!-- END AI-PROSE -->
 
-method:
+<!-- BEGIN MACHINE-READABLE -->
+```yaml
+<YAML serialization of manifest>
+<!-- END MACHINE-READABLE -->
 
-getForObject / getForEntity → "GET"
-postForObject / postForEntity → "POST"
-put → "PUT"
-delete → "DELETE"
-exchange → look at the second argument. If it's HttpMethod.GET / HttpMethod.POST / etc, extract the method literal. If unresolvable, default to "GET".
+Rules:
+- The header is exactly `# store.md — ${manifest.repo}` on a single line, followed by a blank line.
+- Marker comments (`<!-- BEGIN AI-PROSE -->`, etc.) each occupy their own line.
+- Between `<!-- BEGIN MACHINE-READABLE -->` and `<!-- END MACHINE-READABLE -->`, wrap the YAML in a fenced code block with `yaml` language tag.
+- Sections are separated by exactly one blank line each.
+- End the file with a single trailing newline.
 
+---
 
-url: the first argument. See "URL extraction rules" below.
-responseType: for getForObject / postForObject / put / delete, this is the argument ending in .class (typically the last argument). Extract the simple class name — e.g. CustomerResponse.class → "CustomerResponse". For getForEntity / postForEntity, same rule (still a .class argument). For exchange, look for a .class argument or a ParameterizedTypeReference<T> — best effort, extract T if a ParameterizedTypeReference literal is present, else the .class name, else "Object".
+## Behavior
 
-Pattern B — WebClient fluent chains
-Match method_invocation chains that start with a method named get, post, put, or delete called on an object whose type is WebClient, or via a builder pattern. The chain ends with .bodyToMono(SomeType.class) or .bodyToFlux(SomeType.class) or .retrieve().
-Practically:
+1. **Determine target path**: `const storePath = path.join(repoRoot, 'store.md');`
 
-Walk method_invocation nodes. When you find a bodyToMono or bodyToFlux call, walk backward through its receiver chain to find a .uri(...) call and an earlier .get() / .post() / etc that identifies the HTTP method.
-method: from the earlier get()/post()/put()/delete() in the chain (uppercased).
-url: the argument of the .uri(...) call. Use URL extraction rules.
-responseType: the class argument of .bodyToMono(...) or .bodyToFlux(...).
+2. **Uncommitted-changes check** (skip this step entirely if `options?.force === true`):
+   - Check if the file exists (`fs.stat(storePath)` — catch `ENOENT`).
+   - If it exists, run `git status --porcelain store.md` in `repoRoot` via `execFileAsync('git', ['status', '--porcelain', 'store.md'], { cwd: repoRoot })`.
+   - Parse the output. If it's non-empty (any uncommitted change to `store.md`), throw an `Error`:
+     ```typescript
+     const err = new Error(
+       `store.md at ${storePath} has uncommitted changes. ` +
+       `Commit them or re-run with { force: true } to overwrite.`
+     );
+     err.name = 'StoreMdHasUncommittedChanges';
+     throw err;
+     ```
+   - If the git command fails for other reasons (not a git repo, git not installed), log a warning to `console.warn` and continue — do not block writing.
 
-If the chain is malformed or the pieces can't be found, skip the call.
-Pattern C — @FeignClient interfaces
-Match interface_declaration or class_declaration nodes with a @FeignClient annotation. Extract:
+3. **Determine prose content**:
+   - If `prosePreserved` is a non-null string, use it verbatim.
+   - If `prosePreserved` is `null` and the file exists, read the existing file and extract content between `<!-- BEGIN AI-PROSE -->` and `<!-- END AI-PROSE -->` markers. Trim leading/trailing whitespace but preserve internal formatting.
+   - If `prosePreserved` is `null` and no existing prose can be extracted (file missing, markers absent, empty prose), use the default placeholder:
+     ```
+     _(No description yet — regenerate with AI Impact: Generate store.md)_
+     ```
 
-feignUrl: the url attribute value if present; else the name attribute value; else "unknown".
-Iterate method declarations inside the interface. For each method annotated with any of @GetMapping, @PostMapping, @PutMapping, @DeleteMapping, @PatchMapping, or @RequestMapping:
+4. **Serialize the manifest as YAML** using `yaml.stringify(manifest)`. Do not add any options — use library defaults. The resulting string will already end with a newline; keep it as-is when interpolating.
 
-method: from the annotation, same rules as RestExtractor.
-path: from the annotation's path/value argument.
-url: feignUrl + path — used only for provider extraction below; the path itself is stored as path.
-responseType: the method's return type as source text. If Mono<T> / Flux<T> / ResponseEntity<T>, extract T.
-usedFields: empty array [] (Feign interfaces don't have field-access sites).
+5. **Assemble the full markdown content** as a single string using the exact template:
+   ```typescript
+   const content =
+     `# store.md — ${manifest.repo}\n` +
+     `\n` +
+     `<!-- BEGIN AI-PROSE -->\n` +
+     `${proseContent}\n` +
+     `<!-- END AI-PROSE -->\n` +
+     `\n` +
+     `<!-- BEGIN MACHINE-READABLE -->\n` +
+     `\`\`\`yaml\n` +
+     `${yamlContent}` +
+     `\`\`\`\n` +
+     `<!-- END MACHINE-READABLE -->\n`;
+(Adjust newline handling if yaml.stringify output does not end with a newline — ensure the closing fence appears on its own line.)
 
+Write the file:
 
-
-
-URL extraction rules
-An HTTP call's URL argument can be one of several node shapes. Handle these and normalize into a path string:
-
-String literal — "http://cdu-service/customer/{id}" or "/customer/{id}":
-
-Strip quotes.
-If the URL contains ://, split off the scheme and host — the path is everything from the first / after the host.
-Convert {anyName} segments to {} (this matches the normalizer format).
-
-
-String concatenation — "http://cdu-service/customer/" + id:
-
-The URL node is a binary_expression with operator +.
-Walk left-to-right through the chain: for each operand, if it's a string_literal, keep its content; if it's any other expression (identifier, method call, etc), replace with {}.
-Then apply the scheme/host stripping and path normalization above.
-Example: "http://cdu-service/customer/" + id + "/items" → literal parts joined as "http://cdu-service/customer/{}/items", then stripped to /customer/{}/items.
-
-
-String.format — String.format("http://cdu-service/customer/%s", id):
-
-The URL node is a method_invocation with name format on String.
-Take the first string argument as the template.
-Replace every %s, %d, %f, %x, %b, %c, or any % + single letter format specifier with {}.
-Then apply the scheme/host stripping.
-
-
-Variable reference — the URL is a bare identifier like url:
-
-Attempt to trace back to the variable's declaration within the same method's scope. Look for a local_variable_declaration with variable_declarator matching the identifier name.
-If the initializer is a string literal, concatenation, or String.format, apply rules 1-3.
-If not found or fully dynamic (initialized from another variable, method call, etc), skip this call site.
+Use fs.writeFile(storePath, content, 'utf-8').
+Ensure the parent directory exists (it will for the workspace root, but if repoRoot is somehow missing, throw a clear error).
 
 
-Fully dynamic — anything else (method return value, complex expression, ternary, etc): skip the call site entirely.
-
-After extracting the path:
-
-provider: extract from the URL. If the original URL contained ://<host>/..., provider is the host (e.g. "cdu-service"). For Feign, use the feignUrl value (or name attribute if feignUrl was the name). If no host is present (a bare path like /customer/{}), set provider to "unknown".
-path: the normalized path string.
-Strip any trailing / from path unless the path is / itself.
 
 
-usedFields extraction (Patterns A and B only)
-After finding an HTTP call, identify the variable the result was assigned to:
-
-If the call is inside a local_variable_declaration like CustomerResponse response = restTemplate.getForObject(...), the variable name is the declarator's name (response).
-If the call is a statement expression (result not assigned), usedFields = [].
-For WebClient chains, the assignment applies to the terminal .bodyToMono(...) node's declarator.
-
-Once you have the response variable name:
-
-Within the enclosing method body only, find every access of the form <respVar>.<fieldName> (Tree-sitter node type: field_access, with object = identifier matching respVar, field = an identifier).
-Also find getter calls of the form <respVar>.get<FieldName>() (Tree-sitter node type: method_invocation, name starting with get). Convert getPhone → phone by lowercasing the first letter after get.
-Deduplicate by field name.
-For each unique field access, emit { path: "response.<fieldName>", confidence: 'declared' }. Always use the literal string "response" as the prefix in the path, regardless of the actual variable name — this is the canonical form the matcher will use later.
-
-
-Aggregation
-
-Walk the entire file to find calls in all three patterns.
-Emit one HttpCallSite per successful match.
-Set file = filePath and line = 1-indexed line of the HTTP call node (for Pattern C, the line of the method declaration on the Feign interface).
-Return the flat array.
-
-
-Implementation guidance:
-
-Reuse the same walk(node, visitor) recursive helper pattern.
-Java grammar node types you'll use: method_invocation, argument_list, binary_expression, string_literal, identifier, field_access, local_variable_declaration, variable_declarator, interface_declaration, class_declaration, annotation, marker_annotation, annotation_argument_list, element_value_pair.
-For Pattern B (WebClient chains), the receiver chain in Tree-sitter is a nested method_invocation tree — the object field of each method_invocation points to the previous call in the chain.
-Enclosing method: to find the enclosing method for a call node, walk up the parent chain until you hit a method_declaration or constructor_declaration. Use its body for usedFields scoping.
-Use node.text for reading source. Use node.childForFieldName(...) where fields are named (Java grammar names: method_invocation.object, method_invocation.name, method_invocation.arguments, variable_declarator.name, variable_declarator.value, field_access.object, field_access.field).
-
-Error handling:
-
-Wrap outer logic in try/catch. On exception, console.warn and return [].
-Individual call-site failures inside the loop should be caught locally so one bad call doesn't abort the whole file.
+Prose extraction helper (private method)
+Add a private helper method for extracting prose from an existing file:
+typescriptprivate extractExistingProse(fileContent: string): string | null {
+  const beginMarker = '<!-- BEGIN AI-PROSE -->';
+  const endMarker = '<!-- END AI-PROSE -->';
+  const beginIdx = fileContent.indexOf(beginMarker);
+  const endIdx = fileContent.indexOf(endMarker);
+  if (beginIdx === -1 || endIdx === -1 || endIdx < beginIdx) return null;
+  const prose = fileContent
+    .substring(beginIdx + beginMarker.length, endIdx)
+    .trim();
+  return prose.length > 0 ? prose : null;
+}
 
 Do not:
 
-Do not use tree-sitter query strings.
-Do not use fs or Node built-ins beyond imports.
-Do not attempt to resolve types across files.
-Do not emit call sites where the URL is fully dynamic and unresolvable.
-Do not throw. Return [] on any failure.
+Do not use the synchronous child_process.execSync — use the async execFile wrapper shown above.
+Do not use child_process.exec (unsafer than execFile).
+Do not add any extra fields to the output beyond what's specified.
+Do not include timestamps in the header or comment blocks — the timestamp is inside the YAML (generatedAt).
+Do not throw errors other than the specific StoreMdHasUncommittedChanges case. All other failures should be caught, logged via console.warn, and the operation should proceed (fail-safe writes) or propagate as a plain Error only if the file write itself fails.
+Do not modify manifest — treat it as read-only.
+Do not perform any AST parsing or Spring analysis in this file — this is a pure I/O module.
 
 
-Expected output for the provided fixture (test/fixtures/pou-http-caller.java):
-Should return exactly two HttpCallSite entries:
-typescript[
-  {
-    provider: "cdu-service",
-    method: "GET",
-    path: "/customer/{}",
-    responseType: "CustomerResponse",
-    usedFields: [
-      { path: "response.phone", confidence: "declared" }
-    ],
-    file: "pou-http-caller.java",
-    line: 13
-  },
-  {
-    provider: "cdu-service",
-    method: "POST",
-    path: "/customer",
-    responseType: "CustomerResponse",
-    usedFields: [],
-    file: "pou-http-caller.java",
-    line: 17
-  }
-]
-Note: the GET call site tracks the variable url back to String url = "http://cdu-service/customer/" + id (via Pattern A's URL rule 4 → concatenation → rule 2). The POST call site uses a direct string literal argument.
-Complete the file. Write clean, readable code. Add brief comments only where the tree-walking, URL tracing, or usedFields scoping is non-obvious.
+Example: expected file contents after a write
+For a manifest like:
+typescript{
+  schemaVersion: 1,
+  repo: 'CDU',
+  generatedAt: '2026-07-18T10:00:00Z',
+  generatedFromCommit: 'abc1234',
+  provides: { endpoints: [], dtos: [], beans: [] },
+  consumes: { httpCalls: [], beanInjections: [] }
+}
+with prosePreserved = 'This service manages customer records.', the output file should be exactly:
+# store.md — CDU
+
+<!-- BEGIN AI-PROSE -->
+This service manages customer records.
+<!-- END AI-PROSE -->
+
+<!-- BEGIN MACHINE-READABLE -->
+```yaml
+schemaVersion: 1
+repo: CDU
+generatedAt: 2026-07-18T10:00:00Z
+generatedFromCommit: abc1234
+provides:
+  endpoints: []
+  dtos: []
+  beans: []
+consumes:
+  httpCalls: []
+  beanInjections: []
+```
+<!-- END MACHINE-READABLE -->
+Complete the file. Write clean, focused code. Add brief comments only where behavior is non-obvious (prose preservation logic, git check semantics).
