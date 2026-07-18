@@ -1,256 +1,222 @@
-Two independent bugs in the extractor pipeline need fixing:
+Add strategic debug logging to trace a single Java file through the extractor pipeline. The goal: pinpoint the exact step where processing of `DomainAPI.java` (an interface with `@RequestMapping` on methods) drops off and produces zero endpoints. Do not add any logic changes — only logging. Do not modify types, behavior, or control flow.
 
-## Bug 1 — package name never extracted
+Files to modify:
+1. `src/pipeline/GeneratePipeline.ts` — log file walk and per-file handoff.
+2. `src/parser/RestExtractor.ts` — log per-file entry, tree-sitter walk decisions, and per-endpoint emission.
 
-All three extractors (`RestExtractor`, `DtoExtractor`, `BeanExtractor`) are supposed to extract the file's `package` declaration and prepend it to class/interface names to produce fully-qualified names (FQNs). Currently, EVERY extracted DTO's `fqName` is just the simple class name (no dots), and every bean's `type` is the simple class name. This means the file-level `package_declaration` node is never being read successfully — the code silently falls back to the "no package" branch.
+The logs are strategically labeled with a prefix (`[DIAG]`) so they're easy to grep in the console. They log a lot of information but only when triggered by a "file of interest" — a file whose name contains `Api.java`, `API.java`, or `Controller.java`, or whose path contains `/api/`. This keeps the noise manageable while still capturing the interesting cases.
 
-## Bug 2 — a specific interface file (`DomainAPI.java`) produces zero endpoints
+## Change 1 — `src/pipeline/GeneratePipeline.ts`
 
-The regex fallback for interface `@RequestMapping` extraction was added but is not producing results for real interfaces. Either it's not wired in, not called from the main `extract` method, or it's silently failing on the specific pattern.
+Locate the `walkJavaFiles` call and the loop that processes each file. Add these logs:
 
-## The fix — a shared, regex-based package extractor + hardened interface wiring
-
-### Step 1 — create a new shared utility module
-
-Create `src/parser/SourceUtils.ts` with these exports:
+**After `walkJavaFiles` returns:**
 
 ```typescript
-/**
- * Extracts the package name from Java source code using a regex.
- * Robust to whitespace and comments around the declaration.
- * Returns "" if no package declaration is found (default package).
- */
-export function extractPackageName(sourceCode: string): string {
-  // Match: package <dotted.name>;
-  // Allow leading whitespace, comments before it, multi-line comments.
-  const match = sourceCode.match(/^\s*(?:\/\*[\s\S]*?\*\/\s*)*(?:\/\/.*\n\s*)*package\s+([\w.]+)\s*;/m);
-  return match ? match[1] : '';
-}
+console.log(`[DIAG] GeneratePipeline: workspaceRoot = ${workspaceRoot}`);
+console.log(`[DIAG] GeneratePipeline: walked to find files, total = ${files.length}`);
 
-/**
- * Extracts simple-to-FQN mapping from import statements.
- * `import com.x.Y;` → { "Y": "com.x.Y" }
- * `import static com.x.Y.Z;` → ignored (static imports don't help type resolution).
- * `import com.x.*;` → ignored (wildcard imports can't resolve to specific FQNs).
- */
-export function extractImports(sourceCode: string): Map<string, string> {
-  const map = new Map<string, string>();
-  const importRegex = /^\s*import\s+((?!static\s)[\w.]+)\s*;/gm;
-  let m;
-  while ((m = importRegex.exec(sourceCode)) !== null) {
-    const fqn = m[1];
-    if (fqn.endsWith('*')) continue;
-    const parts = fqn.split('.');
-    const simple = parts[parts.length - 1];
-    map.set(simple, fqn);
-  }
-  return map;
-}
-
-/**
- * Resolves a simple type name to its FQN using imports and the current package.
- * If the type appears in `imports`, returns the imported FQN.
- * If the type has dots (already qualified), returns it verbatim.
- * If neither, returns `${currentPackage}.${simpleName}` (assumes same package).
- * If currentPackage is empty, returns the simple name.
- */
-export function resolveTypeName(
-  simpleName: string,
-  imports: Map<string, string>,
-  currentPackage: string
-): string {
-  const trimmed = simpleName.trim();
-  // Handle generics — resolve only the outer type, keep params verbatim.
-  const genericMatch = trimmed.match(/^([\w.]+)(<.*>)$/);
-  if (genericMatch) {
-    const outer = genericMatch[1];
-    const params = genericMatch[2];
-    return resolveTypeName(outer, imports, currentPackage) + params;
-  }
-  if (trimmed.includes('.')) return trimmed;
-  const imported = imports.get(trimmed);
-  if (imported) return imported;
-  if (currentPackage) return `${currentPackage}.${trimmed}`;
-  return trimmed;
-}
-
-/**
- * Compute 1-indexed line number for a character position in the source.
- */
-export function lineForPosition(source: string, pos: number): number {
-  let line = 1;
-  for (let i = 0; i < pos && i < source.length; i++) {
-    if (source[i] === '\n') line++;
-  }
-  return line;
-}
-```
-
-### Step 2 — update the three extractors to use `extractPackageName`
-
-In `src/parser/DtoExtractor.ts`, `src/parser/BeanExtractor.ts`, and `src/parser/RestExtractor.ts`:
-
-- Add import: `import { extractPackageName, extractImports, resolveTypeName } from './SourceUtils';`
-- At the top of each `extract*` method, before any tree-sitter walking:
-  ```typescript
-  const packageName = extractPackageName(sourceCode);
-  const imports = extractImports(sourceCode);
-  ```
-- Replace ALL existing logic that tries to determine the package name from the tree-sitter walk with `packageName` from the helper. Do not remove the tree-sitter walking for the class/interface bodies — only replace the package-name determination step.
-- Where the extractor currently constructs an `fqName` or a bean `type`, use:
-  ```typescript
-  const fqName = packageName ? `${packageName}.${simpleName}` : simpleName;
-  ```
-- Where an extractor resolves an injected/referenced type name (in `BeanExtractor.extractInjections` and `RestExtractor` for `@RequestBody` types), use `resolveTypeName(rawTypeText, imports, packageName)` to get the FQN.
-
-### Step 3 — ensure the RestExtractor regex fallback is actually wired
-
-In `src/parser/RestExtractor.ts`, verify the public `extract` method has this exact structure:
-
-```typescript
-public extract(sourceCode: string, filePath: string): RestEndpoint[] {
-  const treeSitterEndpoints = this.extractWithTreeSitter(sourceCode, filePath);
-  const regexEndpoints = this.extractInterfaceEndpointsViaRegex(sourceCode, filePath);
-  
-  console.debug(
-    `RestExtractor ${filePath}: tree-sitter=${treeSitterEndpoints.length}, regex-fallback=${regexEndpoints.length}`
-  );
-  
-  const seen = new Map<string, RestEndpoint>();
-  for (const ep of treeSitterEndpoints) if (!seen.has(ep.id)) seen.set(ep.id, ep);
-  for (const ep of regexEndpoints) if (!seen.has(ep.id)) seen.set(ep.id, ep);
-  return Array.from(seen.values());
-}
-```
-
-If the tree-sitter logic is currently inline in `extract`, extract it into a new private method `extractWithTreeSitter(sourceCode, filePath): RestEndpoint[]` first. Then wire both into the public `extract` as shown.
-
-The `console.debug` line is CRITICAL — it's how we diagnose whether the regex is running per-file. Keep it in.
-
-### Step 4 — harden the regex fallback for the DomainAPI case
-
-The existing regex fallback pattern may miss the interface if the interface line has an `@RequestMapping("/domain/document")` attached. Verify the interface regex handles this specific case:
-
-```java
-@RequestMapping("/domain/document")
-public interface DomainAPI {
-```
-
-The regex must match:
-- Optional class-level `@RequestMapping(...)` (with any arg form: `"x"`, `value="x"`, `path="x"`)
-- Optional modifiers (`public`, `abstract`)
-- The keyword `interface`
-- The interface name
-- Optional `extends` clause (may span multiple lines with commas and generics)
-- The opening `{`
-
-Update the interface regex:
-
-```typescript
-private interfacePattern = new RegExp(
-  // Optional class-level @RequestMapping — capture path
-  '(?:@RequestMapping\\s*\\(\\s*(?:(?:value|path)\\s*=\\s*)?"([^"]*)"[^)]*\\)\\s*)?' +
-  // Optional other class-level annotations (e.g. @Validated, @Tag) — skip past them
-  '(?:@\\w+(?:\\s*\\([^)]*\\))?\\s*)*' +
-  // Optional modifiers
-  '(?:public\\s+|abstract\\s+)*' +
-  // interface keyword and name
-  'interface\\s+(\\w+)' +
-  // Optional generic params and extends clause (may span lines)
-  '(?:\\s*<[^{]*?>)?' +
-  '(?:\\s+extends\\s+[^{]+?)?' +
-  // Opening brace
-  '\\s*\\{',
-  'gs'
+const filesOfInterest = files.filter(f =>
+  /Api\.java$/i.test(f) || /Controller\.java$/i.test(f) || /\/api\//.test(f)
 );
+console.log(`[DIAG] GeneratePipeline: files of interest (interfaces/controllers/api dirs) = ${filesOfInterest.length}`);
+for (const f of filesOfInterest.slice(0, 20)) {
+  console.log(`[DIAG]   ${f}`);
+}
+if (filesOfInterest.length > 20) {
+  console.log(`[DIAG]   ... and ${filesOfInterest.length - 20} more`);
+}
 ```
 
-The `s` flag lets `.` match newlines, so multi-line `extends` clauses work.
+**Inside the per-file processing loop, right before calling extractors:**
 
-Also: some real interfaces have a `@Validated` or `@Tag` annotation between `@RequestMapping` and `interface`. The `(?:@\\w+(?:\\s*\\([^)]*\\))?\\s*)*` addition skips these.
+```typescript
+const isFileOfInterest =
+  /Api\.java$/i.test(filePath) ||
+  /Controller\.java$/i.test(filePath) ||
+  /\/api\//.test(filePath);
 
-### Step 5 — add strong logging so we can see what's happening in production
+if (isFileOfInterest) {
+  console.log(`[DIAG] GeneratePipeline: about to extract from ${relPath}`);
+  console.log(`[DIAG]   source length = ${src.length} bytes`);
+  console.log(`[DIAG]   source first 200 chars: ${src.substring(0, 200).replace(/\n/g, '\\n')}`);
+}
+```
 
-Add a top-level log at the start of each extractor's public method:
+**After the extractor calls, log the counts:**
+
+```typescript
+if (isFileOfInterest) {
+  const restCount = surface.provides.endpoints.filter(e => e.file === relPath).length;
+  const dtoCount = surface.provides.dtos.filter(d => d.file === relPath).length;
+  const beanCount = surface.provides.beans.filter(b => b.file === relPath).length;
+  console.log(`[DIAG] GeneratePipeline: extracted from ${relPath} → REST=${restCount}, DTO=${dtoCount}, Bean=${beanCount}`);
+}
+```
+
+Note: these counts are computed by filtering the accumulated `surface` arrays for entries whose `file` matches the relative path. This is a simple way to see how many entries each file contributed without changing the extractor API.
+
+Preserve the existing per-file try/catch around extractor calls. The logs go INSIDE the try block for the pre-extraction log, and the post-extraction log too.
+
+Also add one log inside the catch block:
+
+```typescript
+} catch (err) {
+  console.warn(`GeneratePipeline: extractor failed on ${relPath}: ${(err as Error).message}`);
+  if (isFileOfInterest) {
+    console.error(`[DIAG] GeneratePipeline: file of interest FAILED: ${relPath}`);
+    console.error(`[DIAG]   error: ${(err as Error).message}`);
+    console.error(`[DIAG]   stack: ${(err as Error).stack}`);
+  }
+}
+```
+
+## Change 2 — `src/parser/RestExtractor.ts`
+
+At the top of the public `extract` method, before any tree-sitter parsing:
 
 ```typescript
 public extract(sourceCode: string, filePath: string): RestEndpoint[] {
-  const hasInterface = /\binterface\s+\w+/.test(sourceCode);
-  const hasRequestMapping = /@RequestMapping/.test(sourceCode);
-  const packageName = extractPackageName(sourceCode);
+  const isFileOfInterest =
+    /Api\.java$/i.test(filePath) ||
+    /Controller\.java$/i.test(filePath) ||
+    /\/api\//.test(filePath);
   
-  if (hasInterface && hasRequestMapping) {
-    console.log(
-      `RestExtractor: processing interface+@RequestMapping file: ${filePath}, package="${packageName}"`
-    );
+  if (isFileOfInterest) {
+    console.log(`[DIAG] RestExtractor.extract ENTERED: ${filePath}`);
+    console.log(`[DIAG]   hasInterface = ${/\binterface\s+\w+/.test(sourceCode)}`);
+    console.log(`[DIAG]   hasClass = ${/\bclass\s+\w+/.test(sourceCode)}`);
+    console.log(`[DIAG]   hasRequestMapping = ${/@RequestMapping/.test(sourceCode)}`);
+    console.log(`[DIAG]   hasRestController = ${/@RestController/.test(sourceCode)}`);
   }
   
   // ... existing logic
 }
 ```
 
-This gives us a per-file confirmation in the console that (a) the file is reaching the extractor, (b) the package was detected. If we see this line for DomainAPI.java but still get 0 endpoints, the problem is definitively in the regex or tree-sitter walking, not in file discovery or package extraction.
-
-### Step 6 — verify the walker in GeneratePipeline is finding DomainAPI.java
-
-Add one diagnostic log to `src/pipeline/GeneratePipeline.ts` inside the file walking logic:
+**Around the tree-sitter parse call:**
 
 ```typescript
-const files = await walkJavaFiles(searchRoot);
-console.log(`GeneratePipeline: walked ${searchRoot}, found ${files.length} .java files`);
-const apiFiles = files.filter(f => f.includes('DomainAPI') || f.includes('/api/'));
-if (apiFiles.length > 0) {
-  console.log(`GeneratePipeline: found API files: ${apiFiles.slice(0, 5).join(', ')}`);
-} else {
-  console.warn(`GeneratePipeline: NO API files found in walk. Skip rules may be filtering too aggressively.`);
+let tree;
+try {
+  tree = this.parser.parse(sourceCode);
+} catch (err) {
+  if (isFileOfInterest) {
+    console.error(`[DIAG] RestExtractor: parser.parse THREW on ${filePath}: ${(err as Error).message}`);
+  }
+  return [];
+}
+
+if (!tree || !tree.rootNode) {
+  if (isFileOfInterest) {
+    console.error(`[DIAG] RestExtractor: parser.parse returned null tree for ${filePath}`);
+  }
+  return [];
+}
+
+if (isFileOfInterest) {
+  console.log(`[DIAG] RestExtractor: parsed OK, root type = ${tree.rootNode.type}, child count = ${tree.rootNode.namedChildren.length}`);
+  const topLevelTypes = tree.rootNode.namedChildren.map(c => c.type);
+  console.log(`[DIAG] RestExtractor: top-level node types: ${topLevelTypes.join(', ')}`);
 }
 ```
 
-If this log shows 0 API files, the walker is filtering `/api/` folders — check the skip rules in `walkJavaFiles` and make sure `api` is NOT in the skip list. Some codebases use directory names like `api`, `internal`, etc. that might collide with the skip rules.
+The last two logs are the most important. If `topLevelTypes` includes `interface_declaration`, then tree-sitter DID parse the interface — the extractor just isn't handling it. If it does NOT include `interface_declaration`, then the parse failed or the grammar is producing a different node name than we expect.
 
-## Expected outcomes
+**Inside the main walking logic, wherever the extractor decides to process a `class_declaration` or `interface_declaration`:**
 
-After applying the fix and reloading:
+Add logs at the decision points. Look for the code that checks for `@RestController` on classes and for interface declarations:
 
-**In the debug console, you should see:**
+```typescript
+// Wherever class extraction begins:
+if (isFileOfInterest && node.type === 'class_declaration') {
+  const className = node.childForFieldName('name')?.text ?? '?';
+  console.log(`[DIAG] RestExtractor: examining class_declaration "${className}"`);
+  const hasController = /* whatever the existing check is */;
+  console.log(`[DIAG]   has @RestController or @Controller: ${hasController}`);
+}
 
-```
-GeneratePipeline: walked /path/to/CDU/src/main/java, found N .java files
-GeneratePipeline: found API files: /path/to/CDU/src/main/java/com/scb/cdu/api/DomainAPI.java, ...
-...
-RestExtractor: processing interface+@RequestMapping file: <relative-path>/DomainAPI.java, package="com.scb.cdu.api"
-RestExtractor <relative-path>/DomainAPI.java: tree-sitter=0, regex-fallback=3
-```
-
-The third line is the "aha" — it tells us the regex fallback fired and found 3 endpoints. If regex-fallback is 0 in this log, the regex is bugged and we need to debug the pattern directly.
-
-**In the new store.md:**
-
-```bash
-grep -A 3 "fqName:" /path/to/CDU/store.md | head -20
+// Wherever interface extraction begins:
+if (isFileOfInterest && node.type === 'interface_declaration') {
+  const interfaceName = node.childForFieldName('name')?.text ?? '?';
+  console.log(`[DIAG] RestExtractor: examining interface_declaration "${interfaceName}"`);
+}
 ```
 
-Should now show FQNs with dots (`com.scb.cdu.dto.CustomerResponse`, etc.).
+If your extractor's structure is `collectEndpointHosts` + `extractEndpointsFromHost`, put the interface log at the top of `collectEndpointHosts` for each interface node it visits.
 
-```bash
-grep "DomainAPI" /path/to/CDU/store.md
+**At the point where per-method mapping annotations are searched:**
+
+```typescript
+if (isFileOfInterest) {
+  console.log(`[DIAG]   examining method "${methodName}"`);
+  console.log(`[DIAG]     annotations found on method: ${annotationsList.map(a => a.name).join(', ')}`);
+  console.log(`[DIAG]     mapping annotation matched: ${mappingAnnotation?.name ?? 'NONE'}`);
+}
 ```
 
-Should show at least the 3 endpoints from DomainAPI (as `id: POST:/domain/document/upload`, etc.). DomainAPI itself may or may not appear depending on whether it's also being extracted as a DTO — but the endpoints are what matter.
+Where `annotationsList` is however the extractor enumerates the method's annotations. If it's not stored in a variable yet, just enumerate them on the fly for the log:
 
-## Preserve existing behavior
+```typescript
+if (isFileOfInterest) {
+  const annos: string[] = [];
+  // ... walk the method's modifiers/annotations children and push each annotation's name
+  console.log(`[DIAG]   examining method "${methodName}", annotations: ${annos.join(', ')}`);
+}
+```
 
-- Do not modify types in `src/types.ts`.
-- Do not change any public method signatures.
-- Do not remove the try/catch outer wrappers on extractors.
-- Do not remove existing JSDoc comments.
-- Do not modify the store writer, diff engine, matcher, or any downstream component.
+**At the final endpoint emission (or non-emission) per method:**
 
-## Do not
+```typescript
+if (isFileOfInterest) {
+  if (endpoint) {
+    console.log(`[DIAG]   emitting endpoint: ${endpoint.id}`);
+  } else {
+    console.log(`[DIAG]   NOT emitting (reason: no mapping annotation found on method)`);
+  }
+}
+```
 
-- Do not import from `LmClient`, `Prompts`, or any non-parser module.
-- Do not use synchronous `fs` calls (extractors don't touch fs at all — source code is passed as a string).
-- Do not throw. Return `[]` on any error.
-- Do not remove the `console.debug` and `console.log` lines added in this fix — they're your only diagnostic surface in production.
+**At the end of `extract`, before the return statement:**
 
-Complete all four file modifications.
+```typescript
+if (isFileOfInterest) {
+  console.log(`[DIAG] RestExtractor.extract EXITING ${filePath}: returning ${endpoints.length} endpoints`);
+  for (const ep of endpoints) {
+    console.log(`[DIAG]   - ${ep.id} at line ${ep.line}`);
+  }
+}
+```
+
+## What NOT to change
+
+- Do not add regex-based extraction. This is diagnostic only.
+- Do not modify types.
+- Do not modify control flow — every log statement is a pure side effect.
+- Do not modify DtoExtractor or BeanExtractor for this round. Keep the surface area small so we can read the logs.
+- Do not remove existing warnings, JSDoc comments, or error handling.
+
+## After applying
+
+Reload the extension window (`Cmd/Ctrl+R`), run Generate on CDU, then in the debug console:
+
+1. Look for the block `[DIAG] GeneratePipeline: files of interest ...` — this tells you how many API/Controller/interface files the walker found.
+2. Search for the file you care about, e.g. `DomainAPI.java`. You should see a chain of `[DIAG]` lines for that file:
+   - The GeneratePipeline "about to extract" log.
+   - The RestExtractor "ENTERED" log with the four boolean flags.
+   - The RestExtractor "parsed OK" log with top-level node types.
+   - The examining `class_declaration` / `interface_declaration` logs.
+   - The per-method examining logs.
+   - The final "EXITING" log with the count of extracted endpoints.
+
+Wherever the chain breaks off, that's where the bug is. Common patterns:
+
+- If ENTERED log appears but no "parsed OK" → tree-sitter parse failed. The grammar might not handle something in the file.
+- If "parsed OK" appears but top-level types don't include `interface_declaration` → tree-sitter is naming the node differently than expected (rare but possible in older grammar versions).
+- If interface_declaration is seen but no per-method examination logs → the interface body walk is broken.
+- If per-method logs appear but "mapping annotation matched: NONE" → the annotation name matching is broken (maybe fully-qualified `@org.springframework.web.bind.annotation.RequestMapping` isn't being recognized).
+- If mapping annotation IS matched but "NOT emitting" → argument parsing is failing.
+
+The console output is the truth. Paste it back and we'll know exactly what to fix.
+
+Complete both file modifications.
