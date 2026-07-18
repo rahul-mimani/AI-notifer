@@ -1,143 +1,178 @@
-Create a new file src/severity/SeverityScorer.ts that assigns a final consumer-facing status (breaking, review_recommended, safe, unknown) to a change based on its intrinsic severity, the coupling type, and how confidently the consumer is known to use the affected target. This is a pure, deterministic rule-table function — no LLM, no I/O. It runs after the matcher has correlated changes to consumer usage.
-Types are defined in src/types.ts (currently open). Import ChangeEvent and any relevant literal unions from there.
+Create a new file src/freshness/FreshnessChecker.ts that checks how out-of-date a consumer's store.md manifest is by comparing its generatedFromCommit and generatedAt against the consumer repo's current HEAD. The output — a FreshnessInfo — becomes part of every Level 2 impact record in the report, so consumers can see whether the manifest they're being judged against is still trustworthy.
+Types are defined in src/types.ts (currently open). Import FreshnessInfo from there.
 Class shape:
-Export a class SeverityScorer with one public method:
-typescriptscore(input: ScorerInput): ScorerResult;
-Also export these types in the same file:
-typescriptexport interface ScorerInput {
-  change: ChangeEvent;
-  coupling: 'http' | 'bean';
-  usedTargetConfidence: 'declared' | 'inferred' | 'unknown' | null;
-}
-
-export interface ScorerResult {
-  status: 'breaking' | 'review_recommended' | 'safe' | 'unknown';
-  reasoning: string[];
-}
+Export a class FreshnessChecker with one public method:
+typescriptasync check(
+  repoRoot: string,
+  manifestCommit: string,
+  manifestGeneratedAt: string
+): Promise<FreshnessInfo>;
+No constructor arguments, no shared state.
 Imports:
-typescriptimport { ChangeEvent } from '../types';
+typescriptimport { execFile } from 'child_process';
+import { promisify } from 'util';
+import { FreshnessInfo } from '../types';
 
-The usedTargetConfidence field — what it means
-Before defining the rules, understand the three confidence levels:
+const execFileAsync = promisify(execFile);
 
-'declared' — the consumer's store.md explicitly declares this field or method as used, extracted directly from source code (a literal response.fieldName access, a field.methodName(...) call, or a Feign method binding). High trust.
-'inferred' — an LLM decided the consumer probably uses this target based on surrounding code. Never asserted as fact.
-'unknown' — the parser saw a call site but could not determine which fields/methods are used (e.g. the response flows through a mapper).
-null — the matcher found no correlation at all. The consumer touches this surface (endpoint/bean) but not this specific field/method — or the consumer doesn't touch this surface at all.
+Behavior
+The method performs three computations independently and combines them into a FreshnessInfo result. Each computation has a fallback path so that a partial failure still produces a usable result.
+Computation 1 — ageDays
+Compute the age of the manifest in days:
+typescriptconst generatedMs = Date.parse(manifestGeneratedAt);
+const ageDays = isNaN(generatedMs)
+  ? 0
+  : Math.max(0, Math.floor((Date.now() - generatedMs) / 86400000));
 
-The precision principle: only 'declared' usage against a 'breaking' change may produce a 'breaking' status. Everything else is either 'safe' (no usage, no impact) or 'review_recommended' (usage exists but confidence is soft, or the change is potentially rather than definitely breaking).
+Use Math.floor — a manifest generated 30 hours ago is 1 day old, not 2.
+Use Math.max(0, ...) — a manifest with a future timestamp (clock skew, bad input) is treated as 0 days old, not negative.
+Invalid ISO strings (Date.parse returns NaN) default to 0 days. Do not throw. This is a "best available data" module.
 
-The rule table
-Apply the following rules in this exact precedence order. Return on the first match. Each rule produces a status and a reasoning: string[] that explains WHY. The reasoning array is used by the UI to display "why HIGH" or "why safe" to owners.
-Rule 1 — Additive changes are always safe
-If input.change.severity === 'additive':
-typescriptreturn { status: 'safe', reasoning: ['change_is_additive'] };
-An additive change (endpoint added, non-required field added, additive bean method) cannot break existing consumers. Return 'safe' regardless of anything else.
-Rule 2 — No consumer usage means no impact
-If input.usedTargetConfidence === null:
-typescriptreturn { status: 'safe', reasoning: ['consumer_does_not_use_this_surface'] };
-The matcher would only pass null when the correlation found no field-level or method-level usage of the changed target. A breaking change on unused surface is safe for that consumer.
-Rule 3 — Declared usage + breaking change = breaking
-If input.usedTargetConfidence === 'declared' AND input.change.severity === 'breaking':
-typescriptreturn { status: 'breaking', reasoning: ['declared_usage', 'breaking_change'] };
-High confidence in consumer usage + high confidence in breaking severity = a real break. Report as breaking.
-Rule 4 — Inferred usage + breaking change = review recommended
-If input.usedTargetConfidence === 'inferred' AND input.change.severity === 'breaking':
-typescriptreturn { status: 'review_recommended', reasoning: ['inferred_usage', 'breaking_change'] };
-The AI thinks the consumer uses this target but wasn't certain. Never assert this as a hard "you broke Payments" — it's a review_recommended.
-Rule 5 — Unknown usage + breaking change = review recommended
-If input.usedTargetConfidence === 'unknown' AND input.change.severity === 'breaking':
-typescriptreturn { status: 'review_recommended', reasoning: ['unknown_usage_confidence', 'breaking_change'] };
-Parser saw usage exists but couldn't resolve to specific fields/methods. Same treatment as inferred — never hard-assert breaking.
-Rule 6 — Potentially breaking changes with any usage
-If input.change.severity === 'potentially_breaking':
-Compute the confidence tag:
+Computation 2 — commit
+The short SHA displayed to the user:
+typescriptconst commit = manifestCommit.length >= 7 ? manifestCommit.substring(0, 7) : manifestCommit;
 
-If usedTargetConfidence === 'declared' → 'confidence_declared'
-If usedTargetConfidence === 'inferred' → 'confidence_inferred'
-If usedTargetConfidence === 'unknown' → 'confidence_unknown'
-If usedTargetConfidence === null → 'confidence_null' (should be unreachable given rule 2, but include for robustness)
+No git call needed for this — it's a pure string slice.
+Preserve the input verbatim if it's shorter than 7 characters (defensive; shouldn't happen with real SHAs).
 
-Then:
+Computation 3 — javaFilesChangedSince
+This requires two git operations:
+Step 3a — verify the commit exists in the repo.
+Run:
+typescriptawait execFileAsync('git', ['rev-parse', '--verify', `${manifestCommit}^{commit}`], { cwd: repoRoot });
+The ^{commit} suffix ensures the ref actually resolves to a commit object (not a tree or blob). If this command fails (non-zero exit, throws in the promisified form), the commit is not present in the repo — could be a shallow clone, a rebased-away commit, or a completely wrong SHA. In this case:
 typescriptreturn {
-  status: 'review_recommended',
-  reasoning: ['potentially_breaking_change', <confidenceTag>]
+  ageDays,
+  commit,
+  javaFilesChangedSince: -1,
+  flag: 'significantly_drifted',
 };
-Potentially breaking changes (bean rename, qualifier change, condition tightened) never produce a hard breaking verdict even at declared confidence — the change itself is ambiguous.
-Rule 7 — Fallback
-If none of the above matched:
-typescriptreturn { status: 'unknown', reasoning: ['no_matching_rule'] };
-This should not fire in practice — the six rules above exhaust the valid combinations of severity ∈ {breaking, potentially_breaking, additive} × usedTargetConfidence ∈ {declared, inferred, unknown, null}. But include it as a safety net so a future addition to the change taxonomy doesn't silently produce garbage results.
+Also log a warning: console.warn(\FreshnessChecker: commit ${manifestCommit} not found in ${repoRoot}; treating as significantly_drifted.`);`
+Do not attempt Step 3b if 3a fails.
+Step 3b — count changed Java files since the manifest commit.
+Run:
+typescriptconst { stdout } = await execFileAsync(
+  'git',
+  ['diff', '--name-only', `${manifestCommit}`, 'HEAD', '--', '*.java'],
+  { cwd: repoRoot }
+);
+Parse the output:
 
-Reasoning array — format
-The reasoning array is a list of short snake_case tags. The UI treats each tag as a chip or badge. Rules for authoring tags:
+Split on \n.
+Filter out empty lines (empty strings, whitespace-only lines).
+The count of remaining lines is javaFilesChangedSince.
 
-Lowercase snake_case.
-Each tag should stand alone as a fragment: declared_usage, breaking_change, not has_declared_usage_which_indicates_breaking.
-Order doesn't matter functionally, but the rule table above defines the canonical order — preserve it.
-Never include values that vary per call (like a field name or file path). Reasoning tags are categorical labels, not per-instance details.
+If this command fails for any reason (git errored out, output couldn't be read), log a warning and default to:
+typescriptjavaFilesChangedSince = 0;
+// Continue with flag computation using this default.
+Note the asymmetry: a missing-commit failure returns immediately with -1. A diff failure defaults to 0 and continues. This is intentional — if the commit exists but git got confused about the diff, we'd rather show the manifest as "fresh" than falsely flag it as drifted. False drift warnings train users to ignore the freshness banner.
+Computing the flag
+Given ageDays and javaFilesChangedSince, determine the flag using these thresholds:
+typescriptlet flag: 'fresh' | 'stale' | 'significantly_drifted';
+if (ageDays <= 7 && javaFilesChangedSince <= 5) {
+  flag = 'fresh';
+} else if (ageDays <= 30 || javaFilesChangedSince <= 20) {
+  flag = 'stale';
+} else {
+  flag = 'significantly_drifted';
+}
+Read the boolean logic carefully — the second condition uses OR, not AND. This is intentional. A manifest is stale if EITHER the age is under 30 days OR fewer than 20 files have changed since. Only when both are exceeded does it fall through to significantly_drifted.
+The rationale: a manifest that's 40 days old but has only 3 file changes is stale (aged but the repo has been quiet — probably still accurate). A manifest that's 5 days old but has 50 file changes is also stale (young but the repo has churned). Only manifests that are BOTH aged AND churned are significantly drifted.
+Assembling the result
+typescriptreturn {
+  ageDays,
+  commit,
+  javaFilesChangedSince,
+  flag,
+};
 
+Error handling summary
+The method NEVER throws. Every failure mode has a specific fallback:
+
+Invalid manifestGeneratedAt (NaN from Date.parse) → ageDays = 0, continue.
+Missing commit (rev-parse fails) → return early with javaFilesChangedSince = -1, flag = 'significantly_drifted', log warning.
+Diff command fails (other reasons) → javaFilesChangedSince = 0, continue with flag computation, log warning.
+execFile throws for reasons other than the above (e.g. git not installed) → log warning, return { ageDays, commit, javaFilesChangedSince: -1, flag: 'significantly_drifted' }.
+
+Wrap the entire method body in a try/catch as an outer safety net that returns the "worst case" result if something completely unexpected happens.
 
 Implementation shell
-typescriptexport class SeverityScorer {
-  score(input: ScorerInput): ScorerResult {
-    const { change, usedTargetConfidence } = input;
+typescriptexport class FreshnessChecker {
+  async check(
+    repoRoot: string,
+    manifestCommit: string,
+    manifestGeneratedAt: string
+  ): Promise<FreshnessInfo> {
+    // Computation 1 — ageDays (pure)
+    const generatedMs = Date.parse(manifestGeneratedAt);
+    const ageDays = isNaN(generatedMs)
+      ? 0
+      : Math.max(0, Math.floor((Date.now() - generatedMs) / 86400000));
 
-    // Rule 1
-    if (change.severity === 'additive') {
-      return { status: 'safe', reasoning: ['change_is_additive'] };
+    // Computation 2 — commit (pure)
+    const commit = manifestCommit.length >= 7 ? manifestCommit.substring(0, 7) : manifestCommit;
+
+    // Computation 3 — javaFilesChangedSince (git)
+    let javaFilesChangedSince: number;
+
+    try {
+      await execFileAsync('git', ['rev-parse', '--verify', `${manifestCommit}^{commit}`], {
+        cwd: repoRoot,
+      });
+    } catch {
+      console.warn(
+        `FreshnessChecker: commit ${manifestCommit} not found in ${repoRoot}; treating as significantly_drifted.`
+      );
+      return { ageDays, commit, javaFilesChangedSince: -1, flag: 'significantly_drifted' };
     }
 
-    // Rule 2
-    if (usedTargetConfidence === null) {
-      return { status: 'safe', reasoning: ['consumer_does_not_use_this_surface'] };
+    try {
+      const { stdout } = await execFileAsync(
+        'git',
+        ['diff', '--name-only', manifestCommit, 'HEAD', '--', '*.java'],
+        { cwd: repoRoot }
+      );
+      javaFilesChangedSince = stdout
+        .split('\n')
+        .map((l) => l.trim())
+        .filter((l) => l.length > 0).length;
+    } catch (err) {
+      console.warn(
+        `FreshnessChecker: git diff failed in ${repoRoot}: ${(err as Error).message}. Defaulting to 0 changed files.`
+      );
+      javaFilesChangedSince = 0;
     }
 
-    // Rule 3
-    if (usedTargetConfidence === 'declared' && change.severity === 'breaking') {
-      return { status: 'breaking', reasoning: ['declared_usage', 'breaking_change'] };
+    // Flag computation
+    let flag: 'fresh' | 'stale' | 'significantly_drifted';
+    if (ageDays <= 7 && javaFilesChangedSince <= 5) {
+      flag = 'fresh';
+    } else if (ageDays <= 30 || javaFilesChangedSince <= 20) {
+      flag = 'stale';
+    } else {
+      flag = 'significantly_drifted';
     }
 
-    // Rule 4
-    if (usedTargetConfidence === 'inferred' && change.severity === 'breaking') {
-      return { status: 'review_recommended', reasoning: ['inferred_usage', 'breaking_change'] };
-    }
-
-    // Rule 5
-    if (usedTargetConfidence === 'unknown' && change.severity === 'breaking') {
-      return { status: 'review_recommended', reasoning: ['unknown_usage_confidence', 'breaking_change'] };
-    }
-
-    // Rule 6
-    if (change.severity === 'potentially_breaking') {
-      const confidenceTag =
-        usedTargetConfidence === 'declared' ? 'confidence_declared' :
-        usedTargetConfidence === 'inferred' ? 'confidence_inferred' :
-        'confidence_unknown';
-      return {
-        status: 'review_recommended',
-        reasoning: ['potentially_breaking_change', confidenceTag]
-      };
-    }
-
-    // Rule 7 — fallback
-    return { status: 'unknown', reasoning: ['no_matching_rule'] };
+    return { ageDays, commit, javaFilesChangedSince, flag };
   }
 }
-Use this shell verbatim as your starting point. Add JSDoc comments above the class and above score() explaining the intent.
+Use this shell verbatim as your starting point. Wrap the entire method body in an outer try/catch for defense-in-depth, returning { ageDays, commit, javaFilesChangedSince: -1, flag: 'significantly_drifted' } on any unexpected exception with a console.warn describing the failure.
+Add JSDoc comments on the class and the check method explaining the intent and the two failure modes.
 
 Do not
 
-Do not read input.coupling. The http vs bean distinction is metadata for downstream display, not scoring input. It's present in the input type for future rules but the current rule table does not consult it. Do not add any conditional on it.
-Do not read change.kind. The kind field (like DTO_FIELD_REMOVED vs BEAN_METHOD_REMOVED) is metadata for the UI. The scoring is driven only by change.severity and usedTargetConfidence. Adding kind-specific rules leaks scoring logic out of the diff engine, where severity is already decided.
-Do not read change.riskFlags. Same principle — flags exist for the UI. If they need to influence severity, the diff engine should have set change.severity accordingly.
+Do not throw. Every path returns a valid FreshnessInfo.
+Do not use child_process.exec or execSync. Use the promisified execFile.
+Do not use shell metacharacters in the git commands (the execFile form takes an array of arguments — no shell interpolation).
+Do not fetch or pull from the remote. Only local git operations.
+Do not modify the repo state.
+Do not use fs — no file I/O in this module.
+Do not consult the manifest itself. This module receives the two fields (manifestCommit and manifestGeneratedAt) as arguments; it does not read store.md.
 Do not import from any file other than ../types.
-Do not throw. This is pure logic over a well-defined input space.
-Do not add configuration, external rule loading, or plugin points. The rule table is intentionally hard-coded — auditability matters more than flexibility in v1.
 
 
-Expected scoring for representative cases
-To sanity-check your implementation, verify these produce the specified results:
-severityconfidenceexpected statusreasoningadditivedeclaredsafe['change_is_additive']additivenullsafe['change_is_additive']breakingnullsafe['consumer_does_not_use_this_surface']breakingdeclaredbreaking['declared_usage', 'breaking_change']breakinginferredreview_recommended['inferred_usage', 'breaking_change']breakingunknownreview_recommended['unknown_usage_confidence', 'breaking_change']potentially_breakingdeclaredreview_recommended['potentially_breaking_change', 'confidence_declared']potentially_breakinginferredreview_recommended['potentially_breaking_change', 'confidence_inferred']potentially_breakingnullsafe['consumer_does_not_use_this_surface']
-Note the last row: rule 2 fires before rule 6, so null confidence always short-circuits to safe regardless of severity type.
-Complete the file. Keep it small — this module is roughly 50 lines including comments and type exports. Do not over-engineer.
+Expected freshness matrix
+For your reference — verify these produce the specified flags:
+ageDaysjavaFilesChangedSinceexpected flag00fresh53fresh75fresh83stale (age > 7)58stale (files > 5)2510stale403stale (age > 30 but files ≤ 20)525stale (files > 5 but age ≤ 30)4525significantly_drifted (both exceeded)any-1significantly_drifted (missing commit special case)
+Complete the file. This module is small (~60 lines with comments). Do not over-engineer.
+
