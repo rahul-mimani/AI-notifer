@@ -1,157 +1,210 @@
-Create a new file src/store/StoreReader.ts that reads a repo's store.md file, extracts the machine-readable YAML block, parses it into a StoreManifest, validates it, and also extracts the human-written prose block. Types are defined in src/types.ts (currently open). The file format is written by src/store/StoreWriter.ts (also open) — the reader must match its output exactly.
-Class shape:
-Export a class StoreReader with:
+Create a new file src/matcher/PathNormalizer.ts that exports a pure function for normalizing HTTP path strings into a single canonical form. This is the single point where cross-repo path joins happen — provider paths (from Spring annotations) and consumer paths (from URL literals, concatenations, and String.format calls) must both normalize to the same canonical shape so the matcher can join them by string equality.
 
-Constructor: no arguments.
-Method: async read(repoRoot: string): Promise<StoreReadResult> — reads ${repoRoot}/store.md and returns a structured result. Never throws; all errors are captured in the returned object.
+This module has no dependencies on any other file in the project. It does not import from src/types.ts — but keeping that file open gives Copilot the domain context.
 
-Also export the result type:
-typescriptexport interface StoreReadResult {
-  manifest: StoreManifest | null;
-  prose: string | null;
-  error?: string;
-}
-Imports:
-typescriptimport * as fs from 'fs/promises';
-import * as path from 'path';
-import * as yaml from 'yaml';
-import { StoreManifest } from '../types';
+Exports:
 
-Behavior
-The read method must handle four cases in order:
-Case 1 — file does not exist
+typescriptexport function normalizePath(path: string, kind: 'provider' | 'consumer'): string;
 
-Attempt to read ${repoRoot}/store.md with fs.readFile(storePath, 'utf-8').
-Catch ENOENT specifically. On this error, return:
-typescript{ manifest: null, prose: null, error: 'store.md not found' }
-
-On any other read error, return:
-typescript{ manifest: null, prose: null, error: `failed to read store.md: ${err.message}` }
+No class. No default export. Just the one named function.
 
 
-Case 2 — file exists but machine-readable block is missing or malformed
+Canonical form
 
-Locate the block between <!-- BEGIN MACHINE-READABLE --> and <!-- END MACHINE-READABLE --> markers.
-If either marker is missing, or the end marker appears before the begin marker, return:
-typescript{ manifest: null, prose: <extracted prose or null>, error: 'machine-readable block missing or malformed' }
-
-Extract the content between the markers.
-Strip the surrounding fenced code block: the content should have opening ```yaml and closing ``` fences. Match a starting line of ```yaml (possibly with trailing whitespace) and a closing line of ```. Remove both fence lines and any leading/trailing whitespace-only lines.
-If the fence markers are absent, treat the whole block content as YAML (be permissive here — the fence is a convention, not a hard requirement for parsing).
-
-Case 3 — YAML parse failure
-
-Attempt to parse the extracted YAML with yaml.parse(yamlContent).
-Wrap in try/catch. On parse error, return:
-typescript{ manifest: null, prose: <extracted prose or null>, error: `malformed YAML in manifest: ${err.message}` }
+The output of normalizePath is a plain path string where:
 
 
-Case 4 — validation failure
-
-After parsing, validate the object shape against StoreManifest. Requirements:
-
-Must be a non-null object.
-schemaVersion must be the literal number 1.
-repo must be a non-empty string.
-generatedAt must be a non-empty string.
-generatedFromCommit must be a non-empty string.
-provides must be a non-null object with array fields endpoints, dtos, beans (each defaulting to [] if missing — see repair below).
-consumes must be a non-null object with array fields httpCalls, beanInjections (each defaulting to [] if missing).
+All variable segments are represented as the literal three-character sequence {}.
+No trailing slash (unless the entire path is just /).
+No query string.
+Case is preserved.
 
 
-If any required field is missing or wrong type, return:
-typescript{ manifest: null, prose: <extracted prose or null>, error: `malformed manifest: <specific reason>` }
-Include the specific missing/invalid field in the error message (e.g. "malformed manifest: schemaVersion must be 1").
-Repair rule: if provides or consumes exists but is missing sub-array fields (e.g. provides.beans is undefined), fill in [] rather than failing. This is a compat courtesy — older manifests without bean support should still read. Do NOT repair missing top-level required fields (schemaVersion, repo, generatedAt, generatedFromCommit).
-Do not validate the contents of the endpoints[], dtos[], beans[], httpCalls[], or beanInjections[] arrays — deep-shape validation is out of scope for v1. Assume the writer produced correct shapes.
-
-Success case
-
-Return:
-typescript{ manifest: <validated manifest object cast as StoreManifest>, prose: <extracted prose> }
-
-Omit the error field (do not set it to undefined explicitly — omit).
+Examples of the canonical form:
 
 
-Prose extraction
-Prose is extracted from the file whenever possible, even if the manifest fails to parse. Rules:
+/customer/{}
+/orders/{}/items
+/api/v1/customer/{}/orders/{}
+/customer (no variables)
+/ (root path)
+"" (empty input, empty output)
 
-Locate content between <!-- BEGIN AI-PROSE --> and <!-- END AI-PROSE --> markers.
-If either marker is missing, or the end marker appears before the begin marker, prose is null.
-Otherwise, extract the content between the markers and trim leading/trailing whitespace.
-If the trimmed content is empty, prose is null.
-The prose is included in the result on all paths (success, YAML failure, validation failure) as long as it was successfully extracted. Only Case 1 (file missing) has prose: null unconditionally.
 
-Add a private helper for this:
-typescriptprivate extractProse(fileContent: string): string | null {
-  const beginMarker = '<!-- BEGIN AI-PROSE -->';
-  const endMarker = '<!-- END AI-PROSE -->';
-  const beginIdx = fileContent.indexOf(beginMarker);
-  const endIdx = fileContent.indexOf(endMarker);
-  if (beginIdx === -1 || endIdx === -1 || endIdx < beginIdx) return null;
-  const prose = fileContent
-    .substring(beginIdx + beginMarker.length, endIdx)
-    .trim();
-  return prose.length > 0 ? prose : null;
-}
 
-Machine-readable block extraction helper
-Add a private helper for extracting and de-fencing the YAML block:
-typescriptprivate extractYamlBlock(fileContent: string): { yaml: string | null; error?: string } {
-  const beginMarker = '<!-- BEGIN MACHINE-READABLE -->';
-  const endMarker = '<!-- END MACHINE-READABLE -->';
-  const beginIdx = fileContent.indexOf(beginMarker);
-  const endIdx = fileContent.indexOf(endMarker);
-  if (beginIdx === -1 || endIdx === -1 || endIdx < beginIdx) {
-    return { yaml: null, error: 'machine-readable block missing or malformed' };
+Rules for both kinds
+
+Applied before kind-specific processing:
+
+
+If the input contains ?, discard everything from the first ? onward.
+Strip trailing whitespace.
+Case-sensitive throughout — do not lowercase.
+
+
+Applied after kind-specific processing:
+
+
+Strip the trailing / unless the entire result is /.
+
+
+
+Provider kind
+
+Input is the path as written in a Spring annotation. Convert any {anyName} segment to {}.
+
+Examples:
+
+
+"/customer/{id}" → /customer/{}
+"/orders/{orderId}/items" → /orders/{}/items
+"/orders/{orderId}/items/{itemId}" → /orders/{}/items/{}
+"/customer" → /customer
+"/" → /
+"" → ""
+"/customer?foo=bar" → /customer (query stripped)
+"/x/" → /x (trailing slash stripped)
+
+
+Implement with a regex: replace /\{[^}]+\}/g with {}. The character class inside must reject } to avoid greedy matching across segments.
+
+
+Consumer kind
+
+Input is the raw path/URL fragment as it appeared in the consumer source code. This can be any of these shapes because the HttpCallSiteExtractor may pass through several forms. Handle each:
+
+Shape 1 — already templated with Spring-style braces:
+
+
+"/customer/{id}" → /customer/{}
+Same rule as provider.
+
+
+Shape 2 — string concatenation as a literal source fragment:
+
+
+'"/customer/" + id' → /customer/{}
+'"/customer/" + var + "/items"' → /customer/{}/items
+'"/customer/" + a + "/orders/" + b' → /customer/{}/orders/{}
+
+
+Algorithm:
+
+
+Split the input on the + operator.
+For each piece, trim whitespace.
+If the piece starts and ends with ", it's a string literal — take its inner content.
+Otherwise, it's a variable or expression — replace with {}.
+Concatenate all pieces.
+
+
+Shape 3 — String.format call as a literal source fragment:
+
+
+'String.format("/customer/%s", var)' → /customer/{}
+'String.format("/customer/%d/orders/%s", a, b)' → /customer/{}/orders/{}
+'"/customer/%s"' (a lone format template) → /customer/{}
+
+
+Algorithm:
+
+
+Detect String.format(...) syntax with a regex like /^String\.format\(\s*"([^"]+)"/. Extract the format string inside the first argument.
+If not a String.format call but the input contains % format specifiers inside quotes, still process the specifiers.
+Replace every occurrence of % followed by a single letter (from the set s, d, f, x, b, c, o, e, g, n — cover the common Java format specifiers) with {}. Use regex /%[sdfxbcoegn]/g.
+Also handle width specifiers like %3d or %.2f: extend the regex to /%[-+#0-9.]*[sdfxbcoegn]/g.
+
+
+Shape 4 — plain string literal already stripped of quotes:
+
+
+"/customer/{id}" (arrived without quotes) → /customer/{}
+This is the same as Shape 1 or provider.
+
+
+Shape 5 — bare quoted string like '"/customer/x"':
+
+
+The input starts and ends with ". Strip quotes, then process normally.
+
+
+
+URL-to-path stripping
+
+If the input (after any of the above processing) starts with a scheme like http:// or https://, strip the scheme and host:
+
+
+Locate :// in the string.
+After ://, find the next /. Everything from that / onward is the path.
+If there is no / after the host, the path is /.
+
+
+Apply this after shape-specific processing but before the trailing-slash strip. This handles cases where the extractor passed a full URL by accident.
+
+
+Detection heuristics for consumer shape
+
+Since the caller doesn't tell you which shape the input is, detect in order:
+
+
+If input contains String.format( — Shape 3.
+Else if input contains + with " characters — Shape 2.
+Else if input contains % format specifiers — Shape 3 (lone format template).
+Else if input starts and ends with " — Shape 5 (strip quotes and recurse).
+Else — Shape 1/4 (treat as plain path with possible {name} variables).
+
+
+
+Implementation shell
+
+typescriptexport function normalizePath(path: string, kind: 'provider' | 'consumer'): string {
+  if (typeof path !== 'string') return '';
+
+  // Step 1: strip query string
+  let p = path.split('?')[0].trimEnd();
+
+  // Step 2: kind-specific processing
+  if (kind === 'provider') {
+    p = p.replace(/\{[^}]+\}/g, '{}');
+  } else {
+    p = normalizeConsumerPath(p);
   }
-  let block = fileContent
-    .substring(beginIdx + beginMarker.length, endIdx)
-    .trim();
-  // Strip fence markers if present
-  const lines = block.split('\n');
-  if (lines.length >= 2 && lines[0].trim().startsWith('```') && lines[lines.length - 1].trim() === '```') {
-    block = lines.slice(1, -1).join('\n');
+
+  // Step 3: strip scheme and host if URL
+  p = stripSchemeAndHost(p);
+
+  // Step 4: strip trailing slash (unless root)
+  if (p.length > 1 && p.endsWith('/')) {
+    p = p.slice(0, -1);
   }
-  return { yaml: block };
+
+  return p;
 }
 
-Validation helper
-Add a private helper that validates the parsed object and returns either a valid StoreManifest or an error string:
-typescriptprivate validateManifest(parsed: unknown): { manifest: StoreManifest | null; error?: string } {
-  if (parsed === null || typeof parsed !== 'object') {
-    return { manifest: null, error: 'manifest is not an object' };
-  }
-  const m = parsed as Record<string, unknown>;
-  if (m.schemaVersion !== 1) return { manifest: null, error: 'schemaVersion must be 1' };
-  if (typeof m.repo !== 'string' || m.repo.length === 0) return { manifest: null, error: 'repo must be a non-empty string' };
-  if (typeof m.generatedAt !== 'string' || m.generatedAt.length === 0) return { manifest: null, error: 'generatedAt must be a non-empty string' };
-  if (typeof m.generatedFromCommit !== 'string' || m.generatedFromCommit.length === 0) return { manifest: null, error: 'generatedFromCommit must be a non-empty string' };
-  if (m.provides === null || typeof m.provides !== 'object') return { manifest: null, error: 'provides must be an object' };
-  if (m.consumes === null || typeof m.consumes !== 'object') return { manifest: null, error: 'consumes must be an object' };
-  // Repair missing sub-arrays
-  const provides = m.provides as Record<string, unknown>;
-  if (!Array.isArray(provides.endpoints)) provides.endpoints = [];
-  if (!Array.isArray(provides.dtos)) provides.dtos = [];
-  if (!Array.isArray(provides.beans)) provides.beans = [];
-  const consumes = m.consumes as Record<string, unknown>;
-  if (!Array.isArray(consumes.httpCalls)) consumes.httpCalls = [];
-  if (!Array.isArray(consumes.beanInjections)) consumes.beanInjections = [];
-  return { manifest: m as unknown as StoreManifest };
-}
+Add the helpers normalizeConsumerPath(input: string): string and stripSchemeAndHost(input: string): string as private (non-exported) top-level functions in the same file. Keep each helper small and focused.
 
-Error philosophy
 
-read NEVER throws. All exceptions are caught and converted to an error string in the return value.
-Prose extraction is attempted independently of manifest parsing. A file can have valid prose but broken YAML, and both facts should be reported.
-Error messages should be specific enough for the caller to log or display to the user (e.g. "malformed manifest: schemaVersion must be 1" not just "invalid").
+Edge cases to handle explicitly
+
+
+Empty string input → empty string output.
+Input of just / → / (do not strip to empty).
+Input with only variables, no static segments ("{id}") → {}.
+Multiple consecutive slashes ("/x//y") → collapse is NOT required for v1; leave as-is.
+Windows-style backslashes → do NOT convert; treat backslash as any other character.
+Whitespace inside the path ("/customer /{id}") → preserve verbatim (don't try to clean).
+
+
 
 Do not:
 
-Do not throw. Return an error string instead.
-Do not import from child_process — StoreReader does no git operations.
-Do not modify the file on disk.
-Do not attempt to auto-repair fields beyond the specific provides/consumes sub-array defaults described.
-Do not use any AST parsing or Spring-specific logic.
 
-Complete the file. Write focused, clean code. Add brief comments only where the error-handling flow or repair logic is non-obvious.
+Do not import anything from other project files.
+Do not export any additional utilities or types.
+Do not throw on any input. Non-string inputs return "".
+Do not lowercase, uppercase, or otherwise transform case.
+Do not attempt to parse the input as a URL with new URL(...) — the input is often malformed source-code fragments, not real URLs.
+Do not attempt to canonicalize . or .. segments.
+
+
+Complete the file. Write focused, well-commented code. This module is the single point where cross-repo joins can silently fail — clarity and correctness matter more than brevity.
