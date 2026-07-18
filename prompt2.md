@@ -1,254 +1,277 @@
-Create a new file src/matcher/Matcher.ts that joins provider-side ChangeEvents against consumer-side StoreManifest entries to produce matched pairs. This is the correlation step — no scoring, no LLM, no narrative. Just: "for this change on the provider, which consumer call sites and injection points are affected?"
-
-Types are defined in src/types.ts (currently open). Path normalization is in src/matcher/PathNormalizer.ts (also open). StoreManifest shape reference is in src/store/StoreReader.ts (also open). Import from those files as needed.
-
+Create a new file src/diff/DiffEngine.ts that computes ChangeEvent[] by comparing two SurfaceSet values — one representing the "before" state (git base) and one representing the "after" state (working tree). This is the diff step: pure function, no I/O, no LLM, no scoring. Deterministic and trivially testable.
+Types are defined in src/types.ts (currently open). Path normalization exists in src/matcher/PathNormalizer.ts (also open) but is NOT needed here — endpoint IDs are already normalized upstream by the extractors and matcher.
 Class shape:
-
-Export a class Matcher with two public methods, no shared state:
-
-typescriptmatchHttp(
-  changes: ChangeEvent[],
-  consumerManifest: StoreManifest
-): HttpMatch[];
-
-matchBean(
-  changes: ChangeEvent[],
-  consumerManifest: StoreManifest
-): BeanMatch[];
-
-Also export these result types:
-
-typescriptexport interface HttpMatch {
-  change: ChangeEvent;
-  callSite: HttpCallSite;
-  usedField: UsedField | null;
-}
-
-export interface BeanMatch {
-  change: ChangeEvent;
-  injection: BeanInjection;
-  calledMethod: CalledMethod | null;
-}
-
+Export a class DiffEngine with one public method:
+typescriptdiff(from: SurfaceSet, to: SurfaceSet): ChangeEvent[];
+No constructor arguments, no shared state, no async.
 Imports:
-
-typescriptimport {
+typescriptimport * as crypto from 'crypto';
+import {
+  SurfaceSet,
   ChangeEvent,
-  StoreManifest,
-  HttpCallSite,
-  UsedField,
-  BeanInjection,
-  CalledMethod,
+  ChangeKind,
+  RestEndpoint,
+  DtoType,
+  DtoField,
+  BeanDefinition,
+  MethodSignature,
 } from '../types';
-import { normalizePath } from './PathNormalizer';
 
+Algorithm — three independent sub-diffs
+Run these three sub-diffs sequentially and concatenate their results into one flat ChangeEvent[]. Each ChangeEvent gets a unique id via crypto.randomUUID().
 
-matchHttp — HTTP coupling
+Sub-diff 1 — Endpoints
+Keys: RestEndpoint.id (format ${method}:${path}).
+Build two maps: fromById: Map<string, RestEndpoint> from from.provides.endpoints, and toById from to.provides.endpoints.
+For each id in fromById but not in toById:
 
-Iterate changes. For each change, determine whether it targets an HTTP surface (endpoint-level or DTO-field-level where the DTO is used as a response type by a consumer call site). Skip anything else.
+Emit ENDPOINT_REMOVED, severity: 'breaking', surfaceKind: 'endpoint', surfaceId: id.
+before: <the RestEndpoint object>, after: null.
+riskFlags: [].
 
-Two categories of HTTP-relevant change
+For each id in toById but not in fromById:
 
-Category 1 — endpoint-level changes. change.surfaceKind === 'endpoint'.
+Emit ENDPOINT_ADDED, severity: 'additive', surfaceKind: 'endpoint', surfaceId: id.
+before: null, after: <the RestEndpoint object>.
+riskFlags: [].
 
-The surfaceId is formatted as ${method}:${normalizedPath}, e.g. "GET:/customer/{}".
+For each id present in both (common):
 
-For each such change:
+The id already encodes method + path, so if the id matches, method and path are identical by construction.
+Compare responseType. If different, this is meaningful but for v1 we do NOT emit a separate event — response type changes on the same endpoint are captured by the DTO sub-diff if the type is a DTO. Skip for now.
+Do NOT emit ENDPOINT_METHOD_CHANGED here — same-id endpoints have the same method by definition. That change kind exists in the taxonomy for future use (e.g. when we identify moved endpoints); leave it unused in v1.
 
 
-Split surfaceId on the first : to get changeMethod and changePath.
-Normalize changePath via normalizePath(changePath, 'provider').
-Iterate consumerManifest.consumes.httpCalls. For each callSite:
+Sub-diff 2 — DTOs
+Keys: DtoType.fqName.
+Build two maps: fromByFqName and toByFqName from from.provides.dtos and to.provides.dtos.
+For each fqName in both:
 
-Skip if callSite.method !== changeMethod.
-Normalize callSite.path via normalizePath(callSite.path, 'consumer').
-If the normalized paths are equal (string equality after both normalizations), emit:
-typescript{ change, callSite, usedField: null }
+Compare fields.
+Build fromFieldsByName: Map<string, DtoField> from fromDto.fields, and same for toDto.
 
+Removed and added fields (initial pass):
+Collect two arrays:
 
+removedFields: fields in fromFieldsByName but not in toFieldsByName.
+addedFields: fields in toFieldsByName but not in fromFieldsByName.
 
+Rename heuristic pass:
+Within these two arrays for this single DTO:
 
+If removedFields.length === 1 AND addedFields.length === 1 AND their type strings are equal, treat this as a rename:
 
-usedField is always null for endpoint-level matches — the whole endpoint is affected, not a specific field.
+Emit one DTO_FIELD_RENAMED, severity: 'breaking', surfaceKind: 'dto'.
+surfaceId: "${fqName}.${addedField.name}" (use the new name).
+before: <the removed field object>, after: <the added field object>.
+riskFlags: ['renamed_from:' + removedField.name].
+Then clear both arrays (do not emit the individual add/remove events).
 
 
-Category 2 — DTO field-level changes. change.surfaceKind === 'dto'.
 
-The surfaceId for these events is formatted as ${dtoFqName}.${fieldName}, e.g. "com.example.cdu.dto.CustomerResponse.phone".
+Emit remaining removed fields:
+For each remaining removedField:
 
-For each such change:
+Emit DTO_FIELD_REMOVED, severity: 'breaking', surfaceKind: 'dto'.
+surfaceId: "${fqName}.${removedField.name}".
+before: <the removed field>, after: null.
+riskFlags: [].
 
+Emit remaining added fields:
+For each remaining addedField:
 
-Split the surfaceId on the last . to get dtoFqName and changedFieldName.
+If addedField.required === true:
 
-Use lastIndexOf('.') — the FQN itself contains dots.
+Emit DTO_FIELD_ADDED, severity: 'breaking', surfaceKind: 'dto'.
+riskFlags: ['required_field_added'].
 
 
+Else:
 
-Extract the simple name of the DTO from dtoFqName — everything after the final . of the package part. For "com.example.cdu.dto.CustomerResponse" → "CustomerResponse".
-Iterate consumerManifest.consumes.httpCalls. For each callSite:
+Emit DTO_FIELD_ADDED, severity: 'additive', surfaceKind: 'dto'.
+riskFlags: [].
 
-Skip unless callSite.responseType equals the DTO simple name OR the FQN (best-effort — consumer manifests may store either form).
-Iterate callSite.usedFields. For each usedField:
 
-Check whether usedField.path ends with .${changedFieldName} (case-sensitive). Also match the exact string "response.${changedFieldName}" explicitly — this is the canonical form the extractor emits.
-If matched, emit:
-typescript{ change, callSite, usedField }
+surfaceId: "${fqName}.${addedField.name}".
+before: null, after: <the added field>.
 
+Common fields (name present in both):
+For each field name present in both fromFieldsByName and toFieldsByName:
 
+fromField and toField.
+Type change: if fromField.type !== toField.type:
 
+Emit DTO_FIELD_TYPE_CHANGED, severity: 'breaking', surfaceKind: 'dto'.
+surfaceId: "${fqName}.${fieldName}".
+before: <fromField>, after: <toField>.
+riskFlags: [].
 
 
-If no usedField matched, do NOT emit a bare { change, callSite, usedField: null } for a DTO-field-level change — the consumer doesn't use the changed field, so it's not affected. This is intentional: it's the precision guardrail. Only emit when there's a concrete field-use match.
+Required-ness tightened: if fromField.required === false AND toField.required === true:
 
+Emit DTO_FIELD_REQUIREDNESS_CHANGED, severity: 'breaking', surfaceKind: 'dto'.
+surfaceId: "${fqName}.${fieldName}".
+before: <fromField>, after: <toField>.
+riskFlags: ['became_required'].
 
 
+A single field can emit both events if both changed (type change AND required-ness change) — emit them as separate ChangeEvents.
+If required-ness went from true to false (relaxation), do NOT emit any event — that's not breaking.
 
+Note on newly-added DTOs and removed DTOs:
 
-Aggregation and return
+If a DTO is in to but not from (added type): do NOT emit events. The DTO isn't a consumer surface on its own — only its use in an endpoint/bean matters. This is intentional; downstream matcher handles the correlation.
+If a DTO is in from but not to (removed type): do NOT emit events for the same reason. If the DTO was used as a response type on a removed endpoint, that's already captured by ENDPOINT_REMOVED.
 
 
-Return a flat array of all HttpMatch entries produced.
-Order is not significant; iteration order (changes × callSites × usedFields) is fine.
-Do not deduplicate across changes — the same callSite may legitimately match multiple changes.
+Sub-diff 3 — Beans
+Keys: BeanDefinition.name.
+Build two maps: fromByName and toByName from from.provides.beans and to.provides.beans.
+Collect:
 
+removedBeans: names in from but not in to.
+addedBeans: names in to but not in from.
 
+Rename heuristic pass:
+For each pair of one removed and one added bean where removedBean.type === addedBean.type:
 
-matchBean — bean coupling
+Emit BEAN_RENAMED, severity: 'potentially_breaking', surfaceKind: 'bean'.
+surfaceId: <newBeanName>.
+before: <removedBean>, after: <addedBean>.
+riskFlags: ['renamed_from:' + removedBean.name].
+Remove both from the pending arrays.
 
-Iterate changes. For each change with change.surfaceKind === 'bean', correlate against consumerManifest.consumes.beanInjections.
+Note: unlike DTO rename which requires exactly 1-and-1, bean rename can match multiple pairs. Iterate removedBeans and greedily pair with any addedBean sharing the same type. Once paired, remove both.
+Emit remaining removed beans:
+For each remaining removedBean:
 
-Two categories of bean-relevant change
+Emit BEAN_REMOVED, severity: 'breaking', surfaceKind: 'bean'.
+surfaceId: <beanName>.
+before: <removedBean>, after: null.
+riskFlags: [].
 
-Category 1 — bean-level changes. change.kind is one of:
+Emit remaining added beans:
+For each remaining addedBean:
 
+Emit BEAN_ADDED, severity: 'additive', surfaceKind: 'bean'.
+surfaceId: <beanName>.
+before: null, after: <addedBean>.
+riskFlags: [].
 
-BEAN_ADDED — skip (additive, no impact on existing consumers)
-BEAN_REMOVED
-BEAN_RENAMED
-BEAN_QUALIFIER_CHANGED
-BEAN_CONDITIONAL_TIGHTENED
+Common beans (name in both):
+For each bean name in both:
 
+Compare qualifiers arrays. If not deep-equal (same length, same strings, same order), emit:
 
-The surfaceId for bean-level events is the bean name (e.g. "customerService"). The bean's type (FQN of the class or return type) is stored in change.before and/or change.after — access via (change.before as any)?.type or the equivalent from after.
+BEAN_QUALIFIER_CHANGED, severity: 'potentially_breaking', surfaceKind: 'bean'.
+surfaceId: <beanName>.
+before: <fromBean>, after: <toBean>.
+riskFlags: [].
 
-For each such change:
 
+Compare conditionals arrays. If toBean.conditionals contains any string NOT present in fromBean.conditionals (new conditional added), emit:
 
-Extract beanType = (change.before as { type?: string })?.type ?? (change.after as { type?: string })?.type. If neither exists or beanType is empty, skip this change (defensive — should not happen with well-formed events).
-Iterate consumerManifest.consumes.beanInjections. For each injection:
+BEAN_CONDITIONAL_TIGHTENED, severity: 'potentially_breaking', surfaceKind: 'bean'.
+surfaceId: <beanName>.
+before: <fromBean>, after: <toBean>.
+riskFlags: [].
+Do NOT emit if conditionals were REMOVED (that's a relaxation, not a tightening).
 
-If injection.providerType === beanType, emit:
-typescript{ change, injection, calledMethod: null }
 
+Compare publicMethods arrays. Build maps keyed by method name:
 
+fromMethodsByName, toMethodsByName.
+For each method name in from but not to:
 
+Emit BEAN_METHOD_REMOVED, severity: 'breaking', surfaceKind: 'bean'.
+surfaceId: "${beanName}#${methodName}".
+before: { type: fromBean.type, method: <fromMethod> }, after: null.
+riskFlags: [].
+Note: for bean method events, before.type and after.type MUST include the bean's FQN type. The matcher relies on this to correlate against BeanInjection.providerType.
 
 
-calledMethod is always null for bean-level matches.
+For each method name in to but not from:
 
+Emit BEAN_METHOD_ADDED, severity: 'additive', surfaceKind: 'bean'.
+surfaceId: "${beanName}#${methodName}".
+before: null, after: { type: toBean.type, method: <toMethod> }.
+riskFlags: [].
 
-Category 2 — bean-method-level changes. change.kind is one of:
 
+For each method name in both:
 
-BEAN_METHOD_ADDED — skip (additive)
-BEAN_METHOD_REMOVED
-BEAN_METHOD_SIGNATURE_CHANGED
+Compare signatures. If returnType differs OR parameters arrays differ (compare by index, comparing each param's type; parameter names are not part of the signature contract), emit:
 
+BEAN_METHOD_SIGNATURE_CHANGED, severity: 'breaking', surfaceKind: 'bean'.
+surfaceId: "${beanName}#${methodName}".
+before: { type: fromBean.type, method: <fromMethod> }, after: { type: toBean.type, method: <toMethod> }.
+riskFlags: [].
 
-The surfaceId for these events is formatted as ${beanName}#${methodName}, e.g. "customerService#getById". The bean's type is in change.before or change.after.
 
-For each such change:
 
 
-Split surfaceId on # to get beanName and changedMethodName.
-Extract beanType from change.before or change.after as above. Skip if unavailable.
-Iterate consumerManifest.consumes.beanInjections. For each injection:
 
-Skip unless injection.providerType === beanType.
-Iterate injection.calledMethods. For each calledMethod:
 
-Extract the method name from calledMethod.signature. The signature format is "methodName(...)" (e.g. "getById(...)"). Use a regex /^([A-Za-z_$][\w$]*)/ on the signature to capture the leading identifier.
-If the extracted method name equals changedMethodName (exact string match), emit:
-typescript{ change, injection, calledMethod }
 
 
+Utility helpers (private, top-level in file)
+Add these small helpers as non-exported functions in the same file:
+typescriptfunction arraysDeepEqual(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
 
+function methodSignaturesEqual(a: MethodSignature, b: MethodSignature): boolean {
+  if (a.returnType !== b.returnType) return false;
+  if (a.parameters.length !== b.parameters.length) return false;
+  for (let i = 0; i < a.parameters.length; i++) {
+    if (a.parameters[i].type !== b.parameters[i].type) return false;
+  }
+  return true;
+}
 
+function makeMap<T, K>(arr: T[], keyFn: (t: T) => K): Map<K, T> {
+  const m = new Map<K, T>();
+  for (const item of arr) m.set(keyFn(item), item);
+  return m;
+}
 
-Do NOT emit a bare { change, injection, calledMethod: null } when method-level and no method matched — same precision rule as the DTO field case. Only emit when there's a concrete method-use match.
-
-
-
-
-
-Aggregation and return
-
-
-Return a flat array of all BeanMatch entries.
-No deduplication across changes.
-
-
-
-Error handling
-
-
-Neither method throws. Wrap the outer loop of each in try/catch. On unexpected exceptions during a single change's processing, log via console.warn with the change id and error message, then continue with the next change.
-Skipping a change silently on well-defined cases (additive kinds, missing type info) is normal flow — no warning needed.
-
-
+function makeEvent(
+  kind: ChangeKind,
+  surfaceKind: 'endpoint' | 'dto' | 'bean',
+  surfaceId: string,
+  severity: 'breaking' | 'potentially_breaking' | 'additive',
+  before: unknown,
+  after: unknown,
+  riskFlags: string[]
+): ChangeEvent {
+  return {
+    id: crypto.randomUUID(),
+    kind,
+    surfaceKind,
+    surfaceId,
+    severity,
+    before,
+    after,
+    riskFlags,
+  };
+}
 
 Do not
 
+Do not perform any I/O.
+Do not throw. If the input is malformed (missing arrays, wrong shapes), fall back gracefully — treat missing arrays as empty and continue.
+Do not sort the output.
+Do not deduplicate — every rule fires independently, and it's the scorer's job to interpret precedence.
+Do not mutate from or to.
+Do not invent additional change kinds beyond the ChangeKind union in types.ts.
+Do not attempt cross-surface reasoning (e.g. "this endpoint uses this DTO, so ..."). That's the correlator's job.
+Do not emit events for added or removed DTO types — only for fields within DTOs that exist on both sides.
 
-Do not perform severity scoring. That's a separate module.
-Do not call the LLM.
-Do not normalize paths inline — always go through the imported normalizePath function.
-Do not mutate changes, consumerManifest, or any nested structures.
-Do not emit matches for _ADDED change kinds (additive changes have no consumer breakage).
-Do not emit fallback null-usedField or null-calledMethod matches for field-level or method-level changes. Precision requires a concrete match.
-Do not import from child_process, fs, or any I/O module.
 
-
-
-Expected behavior sketch
-
-Given a change:
-
-typescript{
-  id: 'c1',
-  kind: 'DTO_FIELD_REMOVED',
-  surfaceKind: 'dto',
-  surfaceId: 'com.example.cdu.dto.CustomerResponse.phone',
-  severity: 'breaking',
-  before: { name: 'phone', type: 'String' },
-  after: null,
-  riskFlags: []
-}
-
-And a consumer manifest whose consumes.httpCalls includes:
-
-typescript{
-  provider: 'cdu-service',
-  method: 'GET',
-  path: '/customer/{}',
-  responseType: 'CustomerResponse',
-  usedFields: [
-    { path: 'response.phone', confidence: 'declared' },
-    { path: 'response.name', confidence: 'declared' }
-  ],
-  file: 'PouService.java',
-  line: 47
-}
-
-matchHttp should return exactly one HttpMatch:
-
-typescript{
-  change: <the above change>,
-  callSite: <the above callSite>,
-  usedField: { path: 'response.phone', confidence: 'declared' }
-}
-
-If the changed field were unused instead, no match should be emitted — the consumer doesn't read unused.
-
-Complete the file. Write focused, testable code. Use small private helpers for the "extract bean type from change" and "extract method name from signature" operations. Keep the two match methods symmetric in structure.
+Return
+Return a single flat ChangeEvent[] containing all events from all three sub-diffs, in insertion order (endpoints first, then DTOs, then beans). Do not sort.
+Complete the file. Write clean, readable code with each sub-diff clearly delimited by section comments. Prefer small helpers over long inline logic.
