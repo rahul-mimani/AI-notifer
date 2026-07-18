@@ -1,371 +1,285 @@
-Create a new file `src/llm/LmClient.ts` that wraps the VS Code Language Model API (`vscode.lm`) for GitHub Copilot's chat models. This is the single point where the extension talks to an LLM. Every LLM call in the rest of the codebase — for `store.md` prose, impact narratives, migration suggestions, cache lookups — goes through this client.
+Create a new file `src/llm/Prompts.ts` that centralizes the LLM prompt templates used by the extension. This module is pure — it takes structured domain data and returns fully-formed prompt strings ready to be passed to `LmClient.complete` or `LmClient.completeJson`. It performs no I/O and calls no LLM itself.
 
-Types are defined in `src/types.ts` (currently open). The correct `vscode.lm` API shape is demonstrated in `src/extension.ts` (also open) — the smoke test command uses exactly the API surface you must replicate here.
-
----
-
-## Critical: correct `vscode.lm` API shape — do not deviate
-
-The correct API for calling a Copilot chat model in VS Code is exactly:
-
-```typescript
-// 1. Select a model
-const models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
-if (models.length === 0) throw new Error('No Copilot chat model available');
-const model = models[0];
-
-// 2. Build a message
-const message = vscode.LanguageModelChatMessage.User(promptText);
-
-// 3. Send request with a cancellation token
-const cts = new vscode.CancellationTokenSource();
-const request = await model.sendRequest([message], {}, cts.token);
-
-// 4. Stream response chunks
-let response = '';
-for await (const chunk of request.text) {
-  response += chunk;  // chunk is a string
-}
-```
-
-**Do NOT invent any of these:**
-
-- `model.chat(...)` — does not exist.
-- `model.complete(...)` — does not exist.
-- `openai.*`, `anthropic.*` — wrong SDK entirely, this is not the pattern.
-- `.chat.completions.create(...)` — this is the OpenAI SDK shape, not vscode.lm.
-- `sendMessage(...)` — wrong name.
-- `LanguageModelChatMessage.system(...)` in current stable API — use `.User()` only for v1 of this file.
-- Streaming via `.on('data', ...)` — the API is an async iterator, not an event emitter.
-
-If your first attempt at any method uses one of the above, stop and look at `src/extension.ts` for the exact pattern. That file already works — replicate its usage.
+Types are defined in `src/types.ts` (currently open). `LmClient` is in `src/llm/LmClient.ts` (also open) — do not import from it, but the shape of prompts you generate must match what `LmClient` expects (plain strings).
 
 ---
 
-## Class shape
+## Exports
 
-Export a class `LmClient` with the following public surface:
-
-```typescript
-export class LmClient {
-  async initialize(): Promise<void>;
-  async complete(prompt: string, options?: LmCompleteOptions): Promise<string>;
-  async completeJson<T>(prompt: string, options?: LmCompleteOptions): Promise<T>;
-  getCachePath(): string;
-  async preBake(entries: PreBakeEntry[]): Promise<void>;
-  static async loadPreBakedCache(bundlePath: string): Promise<void>;
-}
-```
-
-Also export these supporting types in the same file:
+Export these from this module:
 
 ```typescript
-export interface LmCompleteOptions {
-  cacheKey?: string;
-  timeoutMs?: number;  // defaults to 30000
-}
+export const PROMPT_VERSION = '1.0.0';
 
-export interface PreBakeEntry {
-  cacheKey: string;
-  response: string;
-}
+export function buildStoreProsePrompt(surfaceSet: SurfaceSet, repoName: string): string;
+export function buildImpactNarrativePrompt(record: ImpactRecord): string;
+export function buildMigrationSuggestionPrompt(record: ImpactRecord, callSiteCode: string): string;
 ```
 
-**Private state:**
-
-```typescript
-private model: vscode.LanguageModelChat | null = null;
-```
+That's it — no class, no default export, three named functions plus a constant.
 
 **Imports:**
 
 ```typescript
-import * as vscode from 'vscode';
-import * as fs from 'fs/promises';
-import * as path from 'path';
-import * as os from 'os';
-import * as crypto from 'crypto';
+import { SurfaceSet, ImpactRecord, RestEndpoint, BeanDefinition } from '../types';
 ```
-
-Note: no imports from other project files. This module has no domain dependencies.
 
 ---
 
-## Method: `initialize`
+## `PROMPT_VERSION`
+
+A hard-coded version string. Rev this manually when prompt content changes materially — the cache uses prompt content as the key, but if you materially change what a prompt asks for, you may want to invalidate old cache entries by bumping this and including it in cache keys upstream.
 
 ```typescript
-async initialize(): Promise<void>
+export const PROMPT_VERSION = '1.0.0';
 ```
 
-Behavior:
-1. Call `vscode.lm.selectChatModels({ vendor: 'copilot' })`.
-2. If the returned array is empty, throw:
-   ```typescript
-   throw new Error(
-     'No Copilot chat model available. Install/sign in to GitHub Copilot and try again.'
-   );
+---
+
+## `buildStoreProsePrompt`
+
+**Signature:**
+```typescript
+export function buildStoreProsePrompt(surfaceSet: SurfaceSet, repoName: string): string
+```
+
+**Purpose:** Generates the prompt that asks the LLM to write the human-readable prose section of `store.md`. This becomes the `<!-- BEGIN AI-PROSE -->` block content.
+
+**Structure the returned prompt in this order:**
+
+1. **Framing line.**
    ```
-3. Store `models[0]` on `this.model`.
-4. If `this.model` is already set (initialize called twice), return early without re-selecting.
-
-This method is called once per extension session, typically from `extension.ts` `activate` (lazily, on first LLM use).
-
----
-
-## Method: `complete`
-
-```typescript
-async complete(prompt: string, options?: LmCompleteOptions): Promise<string>
-```
-
-Behavior:
-
-**Step 1 — cache lookup.**
-
-If `options?.cacheKey` is provided:
-- Compute cache path: `path.join(this.getCachePath(), `${options.cacheKey}.txt`)`.
-- Try to read the file. If it exists, return its contents verbatim (do not call the LLM).
-- If it doesn't exist, continue to Step 2. Do not treat missing cache as an error.
-
-**Step 2 — ensure model is initialized.**
-
-If `this.model === null`, call `await this.initialize()`. If that throws, propagate.
-
-**Step 3 — call the LLM with a timeout.**
-
-Build the message and send the request:
-```typescript
-const message = vscode.LanguageModelChatMessage.User(prompt);
-const cts = new vscode.CancellationTokenSource();
-const request = await this.model!.sendRequest([message], {}, cts.token);
-```
-
-Race the streaming against a timeout:
-```typescript
-const timeoutMs = options?.timeoutMs ?? 30000;
-const timeoutPromise = new Promise<never>((_, reject) => {
-  setTimeout(() => {
-    cts.cancel();
-    reject(new Error(`LLM request timed out after ${timeoutMs}ms`));
-  }, timeoutMs);
-});
-
-const streamPromise = (async () => {
-  let response = '';
-  for await (const chunk of request.text) {
-    response += chunk;
-  }
-  return response;
-})();
-
-const response = await Promise.race([streamPromise, timeoutPromise]);
-```
-
-The `cts.cancel()` in the timeout path attempts to signal the underlying LLM call to abort.
-
-**Step 4 — cache write-back.**
-
-If `options?.cacheKey` was provided and the call succeeded:
-- Ensure the cache directory exists: `await fs.mkdir(this.getCachePath(), { recursive: true });`
-- Write the response: `await fs.writeFile(cachePath, response, 'utf-8');`
-- Do not fail the overall call if the write fails — log via `console.warn` and return the response anyway.
-
-**Step 5 — return.**
-
-Return the response string as-is (no trimming, no processing).
-
-**Error handling for `complete`:**
-
-- Timeout → the `Promise.race` throws the timeout error, which propagates to the caller.
-- LLM errors (Copilot returned an error, network issue) → let them propagate. The caller (typically a pipeline) is responsible for deciding whether to degrade gracefully.
-- Cache read errors (permission denied, etc, other than ENOENT) → log warning, treat as cache miss, continue to LLM call.
-- Cache write errors → log warning, still return the response.
-
----
-
-## Method: `completeJson<T>`
-
-```typescript
-async completeJson<T>(prompt: string, options?: LmCompleteOptions): Promise<T>
-```
-
-Wraps `complete` for callers that need structured output.
-
-Behavior:
-
-**Step 1 — augment prompt.**
-
-Append this exact suffix to the prompt:
-```
-\n\nRespond with ONLY valid JSON. No markdown code fences, no prose, no preamble.
-```
-
-Call `complete(augmentedPrompt, options)`.
-
-**Step 2 — strip accidental code fences.**
-
-The LLM may still wrap its response in ```` ```json ```` fences despite instructions. Strip them:
-- If the response trimmed starts with ```` ```json ```` or ```` ``` ````, remove the opening fence line.
-- If it ends with ```` ``` ````, remove the closing fence line.
-- Use a robust regex or line-by-line strip — the response might have trailing whitespace or newlines around the fences.
-
-**Step 3 — parse JSON.**
-
-Try `JSON.parse(cleanedResponse)`. Return as `T`.
-
-**Step 4 — retry once on parse failure.**
-
-If `JSON.parse` throws:
-- Log warning: `console.warn('LmClient.completeJson: first attempt returned invalid JSON, retrying');`
-- Build a retry prompt by appending to the ORIGINAL prompt (not the augmented one, to avoid compounding suffixes):
-  ```
-  \n\nYour previous response was invalid JSON. Respond with ONLY the JSON object, no fences, no prose. Just the object, starting with { and ending with }.
-  ```
-- Call `complete(retryPrompt, options)` — note: bypass the cache on retry by passing `{ ...options, cacheKey: undefined }` so the retry actually re-queries the LLM.
-- Strip fences again.
-- `JSON.parse` again. If this throws too, throw an error with a message including both the raw response and the parse error:
-  ```typescript
-  throw new Error(
-    `LmClient.completeJson: failed to parse JSON after retry. ` +
-    `Raw response: ${cleanedResponse.substring(0, 500)}. ` +
-    `Parse error: ${(err as Error).message}`
-  );
-  ```
-
----
-
-## Method: `getCachePath`
-
-```typescript
-getCachePath(): string
-```
-
-Returns the absolute path to the extension's cache directory:
-
-```typescript
-return path.join(os.homedir(), '.ai-change-impact-notifier', 'cache');
-```
-
-Synchronous. Does not create the directory — that's the caller's responsibility (or handled inside `complete`).
-
----
-
-## Method: `preBake`
-
-```typescript
-async preBake(entries: PreBakeEntry[]): Promise<void>
-```
-
-Writes cache entries in bulk. Used by `loadPreBakedCache` and can also be called directly.
-
-Behavior:
-1. Ensure cache dir exists: `await fs.mkdir(this.getCachePath(), { recursive: true });`
-2. For each entry, write `${cachePath}/${entry.cacheKey}.txt` with `entry.response` as content.
-3. If any individual write fails, log a warning with the specific cacheKey and continue with the next. Do not abort the whole operation.
-
----
-
-## Static method: `loadPreBakedCache`
-
-```typescript
-static async loadPreBakedCache(bundlePath: string): Promise<void>
-```
-
-Loads a bundled cache from a JSON file. Used at extension startup to seed the cache with pre-computed LLM responses for demo reliability.
-
-Behavior:
-1. Read the JSON file at `bundlePath`. On ENOENT, silently return (no bundle present is normal, not an error).
-2. Parse as `PreBakeEntry[]`. If parse fails, log warning and return.
-3. Validate: must be an array. Each entry must have `cacheKey: string` and `response: string`. Skip invalid entries with a warning.
-4. Create a temporary `LmClient` instance just to reuse `preBake`:
-   ```typescript
-   const client = new LmClient();
-   await client.preBake(validEntries);
+   You are documenting a Spring Boot service named ${repoName}.
    ```
-5. Log a summary: `console.log(\`LmClient: loaded ${validEntries.length} pre-baked cache entries from ${bundlePath}\`);`
 
-Does not throw. All failures are logged and swallowed — the extension should function normally without a bundled cache.
+2. **Extracted surface summary — compact bullets.** Enumerate the endpoints and beans in compact form. Skip DTOs (they're internal detail, not surface prose worth documenting).
+
+   Format the endpoints as one line each:
+   ```
+   - ${endpoint.method} ${endpoint.path} → ${endpoint.responseType}
+   ```
+
+   For beans:
+   ```
+   - ${bean.name} (${bean.type}) with methods: ${methodNames.join(', ')}
+   ```
+   Where `methodNames` is the list of `bean.publicMethods.map(m => m.name)`. If a bean has no public methods, use `"(no public methods)"` instead of an empty list.
+
+   Precede each list with a subheading:
+   ```
+   
+   ENDPOINTS:
+   <bullets>
+   
+   BEANS:
+   <bullets>
+   ```
+
+   If either list is empty, still include the subheading and write `(none)` beneath it. This tells the LLM the surface was extracted and is genuinely empty, versus omitted.
+
+3. **Instructions block.** Ask the LLM to write markdown with specific sections and constraints:
+
+   ```
+   
+   Write a concise markdown document describing this service. Use exactly these sections in this order:
+   
+   ## Overview
+   A 2-3 sentence description of what this service does, inferred from the endpoints and beans above. Do not speculate about business context beyond what the surface reveals.
+   
+   ## Endpoints
+   One line per endpoint. Format: `- \`${method} ${path}\` — <one-line description of likely purpose>`. Base the description on the path and response type. Do not invent request/response semantics not implied by the surface.
+   
+   ## Beans
+   One line per bean. Format: `- \`${beanName}\` — <one-line description of its role>`. If the bean has no public methods, note it as an internal collaborator.
+   
+   Constraints:
+   - Output only the markdown content. No preamble, no explanation, no code fences around the whole thing.
+   - Do not add sections beyond the three specified.
+   - Do not fabricate details. If the surface is minimal, keep the prose minimal.
+   - Do not include the repo name in a top-level # header. Start with `## Overview`.
+   ```
+
+**Do not use interpolated backticks inside the instructions block** in a way that would break the outer template literal — you'll need to escape them (e.g. `\`${method} ${path}\``) or use string concatenation for those specific lines.
+
+**Example output (for reference — for a repo with 2 endpoints and 1 bean):**
+
+```
+You are documenting a Spring Boot service named CDU.
+
+ENDPOINTS:
+- GET /api/v1/customer/{id} → CustomerResponse
+- POST /api/v1/customer → CustomerResponse
+
+BEANS:
+- customerService (com.example.cdu.service.CustomerService) with methods: getById, updatePhone
+
+Write a concise markdown document describing this service. Use exactly these sections in this order:
+
+## Overview
+[...instructions as above...]
+```
 
 ---
 
-## Utility: computing cache keys from prompts (optional helper)
+## `buildImpactNarrativePrompt`
 
-Since callers often want to derive a stable cache key from the prompt content itself, add a static helper:
-
+**Signature:**
 ```typescript
-static hashPrompt(prompt: string): string {
-  return crypto.createHash('sha256').update(prompt).digest('hex').substring(0, 16);
-}
+export function buildImpactNarrativePrompt(record: ImpactRecord): string
 ```
 
-Callers can use this to generate cache keys like `narrative-${LmClient.hashPrompt(prompt)}`.
+**Purpose:** Generates the prompt that asks the LLM to write a 2-3 sentence narrative explaining an impact to the consumer owner. The LLM's response goes into `record.narrative`.
+
+**Structure the returned prompt:**
+
+1. **Framing.**
+   ```
+   You are writing a 2-3 sentence impact notification for a Spring Boot developer whose service consumes another service and may be affected by a change.
+   ```
+
+2. **The change — structured details.** Emit these fields in labeled form:
+   ```
+   
+   CHANGE:
+   - Kind: ${record.changeEvent.kind}
+   - Surface: ${record.changeEvent.surfaceId}
+   - Severity: ${record.changeEvent.severity}
+   - Before: ${JSON.stringify(record.changeEvent.before)}
+   - After: ${JSON.stringify(record.changeEvent.after)}
+   ${record.changeEvent.riskFlags.length > 0 ? `- Risk flags: ${record.changeEvent.riskFlags.join(', ')}` : ''}
+   ```
+
+3. **The coupling and consumer's usage.**
+   ```
+   
+   COUPLING: ${record.coupling}
+   CONSUMER: ${record.consumer}
+   CALL SITE: ${record.callSite.file}:${record.callSite.line}
+   USED TARGET: ${record.usedTarget}
+   CONFIDENCE: ${record.usedTargetConfidence ?? 'none'}
+   ```
+
+4. **The resulting status.**
+   ```
+   
+   STATUS: ${record.status} (reasoning: ${record.reasoning.join(', ')})
+   ```
+
+5. **Instructions.**
+   ```
+   
+   Write a 2-3 sentence notification directed at the developer of ${record.consumer}. Requirements:
+   - Direct and technical. No hedging phrases like "you might want to" or "please consider".
+   - State clearly WHAT changed, WHERE in their code it matters (file:line), and WHAT the effect is.
+   - If the confidence is 'inferred' or 'unknown', say the impact "may" or "likely" apply rather than asserting it as fact.
+   - If the confidence is 'declared', state the impact as fact.
+   - No preamble, no sign-off. Plain text only. No markdown. 2-3 sentences, no more.
+   ```
+
+**Do not** include the raw JSON of the whole `ImpactRecord` in the prompt — enumerate the fields explicitly as above so the LLM doesn't get confused by shape variations.
+
+**Do not** include the LLM's own future narrative or migration suggestion in the prompt — those fields on `record` may be undefined at prompt-building time.
+
+---
+
+## `buildMigrationSuggestionPrompt`
+
+**Signature:**
+```typescript
+export function buildMigrationSuggestionPrompt(record: ImpactRecord, callSiteCode: string): string
+```
+
+**Purpose:** Generates the prompt that asks the LLM to suggest a concrete code change to the consumer as a unified diff. The LLM's response goes into `record.migrationSuggestion`.
+
+The `callSiteCode` argument is provided by the caller — typically 5 lines before and 5 lines after the affected call site, read from the consumer file. The caller is responsible for gathering this; this module does not read files.
+
+**Structure the returned prompt:**
+
+1. **Framing.**
+   ```
+   You are suggesting a code change to a Spring Boot consumer service to adapt to a change in a provider service. Your output must be a unified diff patch, nothing else.
+   ```
+
+2. **The change — same block as narrative prompt.** Reuse the same labeled format:
+   ```
+   
+   CHANGE:
+   - Kind: ${record.changeEvent.kind}
+   - Surface: ${record.changeEvent.surfaceId}
+   - Before: ${JSON.stringify(record.changeEvent.before)}
+   - After: ${JSON.stringify(record.changeEvent.after)}
+   ```
+
+3. **The call site code.** Wrap in a fence so the LLM knows exactly what code to modify:
+   ```
+   
+   CALL SITE (${record.callSite.file}:${record.callSite.line}):
+   \`\`\`java
+   ${callSiteCode}
+   \`\`\`
+   ```
+
+4. **Instructions.**
+   ```
+   
+   Suggest the minimum code change to adapt this call site to the provider change. Requirements:
+   - Output a unified diff patch in standard format: `--- a/${filepath}`, `+++ b/${filepath}`, `@@ ... @@` hunk headers, `-` lines for removals, `+` lines for additions, unchanged context lines starting with a single space.
+   - Use the file path `${record.callSite.file}` in the `---` and `+++` headers.
+   - Only modify the call site region shown. Do not invent code changes elsewhere.
+   - If the change is a field removal and the consumer reads a now-missing field, suggest either removing the read or adapting to the new provider shape.
+   - If the change is a method signature change, adapt the arguments accordingly.
+   - Output ONLY the diff. No preamble, no explanation, no code fences around the whole diff (the diff itself uses --- and +++ lines, which is standard).
+   ```
+
+**Handling the diff header path:** be aware that `record.callSite.file` may be relative or absolute depending on how the caller populated it. Emit it verbatim — the caller is responsible for path normalization if needed.
+
+---
+
+## Style constraints for all three functions
+
+Every prompt built by this module must follow these rules — they exist to keep LLM output predictable across cache runs and demo dry runs:
+
+- **Deterministic content.** No timestamps, no random IDs, no environment-dependent values. Two invocations with identical inputs must produce identical prompts (this is what makes cache keys stable).
+- **No conversational tone in prompts.** Avoid "please", "could you", "would you mind". Direct instructions only.
+- **Explicit output format.** Every prompt ends with a clear instruction about output format (plain text, markdown, or diff). Never leave the format ambiguous.
+- **Explicit anti-preamble.** Every prompt includes "no preamble" or "no explanation" as instructions. LLMs love to say "Sure, here's the notification:" and this must be suppressed.
 
 ---
 
 ## Do not
 
-- Do not use `require(...)` — use ES imports.
-- Do not use the OpenAI SDK, Anthropic SDK, or any other LLM library.
-- Do not implement retry logic beyond the single JSON-parse retry described. Network retries are the LLM provider's job.
-- Do not attempt to detect model capabilities or filter by model name — `selectChatModels({ vendor: 'copilot' })` is enough for v1.
-- Do not add rate limiting.
-- Do not cache in-memory across calls beyond what the filesystem cache provides.
-- Do not throw from `loadPreBakedCache` — it must be safe to call unconditionally at startup.
-- Do not import from `../types` or any other project file.
-- Do not use `System` or `Assistant` messages in v1 — only `.User(prompt)`.
+- Do not import from `LmClient` or call any LLM function. This module builds strings.
+- Do not read any files. `callSiteCode` is provided as an argument for the migration prompt.
+- Do not mutate the input arguments.
+- Do not throw. If a field is missing on `record` (should not happen with well-typed input, but defensive), substitute a sensible default like `"(unknown)"` and continue.
+- Do not include the `PROMPT_VERSION` constant in the prompt bodies. It's for cache invalidation, not model context.
+- Do not use different JSON serialization for `before`/`after` — always `JSON.stringify` with no indent (single-line).
+- Do not include any dynamic date, time, or random information in the prompt output.
 
 ---
 
-## Skeleton to fill in
+## Skeleton
 
 ```typescript
-import * as vscode from 'vscode';
-import * as fs from 'fs/promises';
-import * as path from 'path';
-import * as os from 'os';
-import * as crypto from 'crypto';
+import { SurfaceSet, ImpactRecord, RestEndpoint, BeanDefinition } from '../types';
 
-export interface LmCompleteOptions {
-  cacheKey?: string;
-  timeoutMs?: number;
+export const PROMPT_VERSION = '1.0.0';
+
+export function buildStoreProsePrompt(surfaceSet: SurfaceSet, repoName: string): string {
+  // ... assemble per spec above
 }
 
-export interface PreBakeEntry {
-  cacheKey: string;
-  response: string;
+export function buildImpactNarrativePrompt(record: ImpactRecord): string {
+  // ... assemble per spec above
 }
 
-export class LmClient {
-  private model: vscode.LanguageModelChat | null = null;
-
-  async initialize(): Promise<void> {
-    // ... per spec above
-  }
-
-  async complete(prompt: string, options?: LmCompleteOptions): Promise<string> {
-    // ... per spec above (cache lookup → init → LLM call with timeout → cache write → return)
-  }
-
-  async completeJson<T>(prompt: string, options?: LmCompleteOptions): Promise<T> {
-    // ... per spec above (augment prompt → complete → strip fences → parse → retry once on failure)
-  }
-
-  getCachePath(): string {
-    return path.join(os.homedir(), '.ai-change-impact-notifier', 'cache');
-  }
-
-  async preBake(entries: PreBakeEntry[]): Promise<void> {
-    // ... per spec above
-  }
-
-  static async loadPreBakedCache(bundlePath: string): Promise<void> {
-    // ... per spec above
-  }
-
-  static hashPrompt(prompt: string): string {
-    return crypto.createHash('sha256').update(prompt).digest('hex').substring(0, 16);
-  }
+export function buildMigrationSuggestionPrompt(record: ImpactRecord, callSiteCode: string): string {
+  // ... assemble per spec above
 }
 ```
 
-Fill in each method body per the specifications above. Preserve the exact API shape shown in the "Critical" section for the `vscode.lm` calls — do not invent alternatives. Add JSDoc comments on each public method explaining its behavior in 2-3 lines. Complete the file.
+Fill in each function per the specifications. Use small local helpers if it improves readability (e.g. a `formatEndpointBullet(endpoint: RestEndpoint): string` helper). Keep them non-exported.
+
+Add JSDoc comments on each exported function explaining what LLM task it drives and what field of the domain object the LLM's response is destined for.
+
+Complete the file.
