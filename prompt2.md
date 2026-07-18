@@ -1,257 +1,371 @@
-Create a new file `src/freshness/FreshnessChecker.ts` that checks how out-of-date a consumer's `store.md` manifest is by comparing its `generatedFromCommit` and `generatedAt` against the consumer repo's current HEAD. The output — a `FreshnessInfo` — becomes part of every Level 2 impact record in the report, so consumers can see whether the manifest they're being judged against is still trustworthy.
+Create a new file `src/llm/LmClient.ts` that wraps the VS Code Language Model API (`vscode.lm`) for GitHub Copilot's chat models. This is the single point where the extension talks to an LLM. Every LLM call in the rest of the codebase — for `store.md` prose, impact narratives, migration suggestions, cache lookups — goes through this client.
 
-Types are defined in `src/types.ts` (currently open). Import `FreshnessInfo` from there.
+Types are defined in `src/types.ts` (currently open). The correct `vscode.lm` API shape is demonstrated in `src/extension.ts` (also open) — the smoke test command uses exactly the API surface you must replicate here.
 
-**Class shape:**
+---
 
-Export a class `FreshnessChecker` with one public method:
+## Critical: correct `vscode.lm` API shape — do not deviate
+
+The correct API for calling a Copilot chat model in VS Code is exactly:
 
 ```typescript
-async check(
-  repoRoot: string,
-  manifestCommit: string,
-  manifestGeneratedAt: string
-): Promise<FreshnessInfo>;
+// 1. Select a model
+const models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
+if (models.length === 0) throw new Error('No Copilot chat model available');
+const model = models[0];
+
+// 2. Build a message
+const message = vscode.LanguageModelChatMessage.User(promptText);
+
+// 3. Send request with a cancellation token
+const cts = new vscode.CancellationTokenSource();
+const request = await model.sendRequest([message], {}, cts.token);
+
+// 4. Stream response chunks
+let response = '';
+for await (const chunk of request.text) {
+  response += chunk;  // chunk is a string
+}
 ```
 
-No constructor arguments, no shared state.
+**Do NOT invent any of these:**
+
+- `model.chat(...)` — does not exist.
+- `model.complete(...)` — does not exist.
+- `openai.*`, `anthropic.*` — wrong SDK entirely, this is not the pattern.
+- `.chat.completions.create(...)` — this is the OpenAI SDK shape, not vscode.lm.
+- `sendMessage(...)` — wrong name.
+- `LanguageModelChatMessage.system(...)` in current stable API — use `.User()` only for v1 of this file.
+- Streaming via `.on('data', ...)` — the API is an async iterator, not an event emitter.
+
+If your first attempt at any method uses one of the above, stop and look at `src/extension.ts` for the exact pattern. That file already works — replicate its usage.
+
+---
+
+## Class shape
+
+Export a class `LmClient` with the following public surface:
+
+```typescript
+export class LmClient {
+  async initialize(): Promise<void>;
+  async complete(prompt: string, options?: LmCompleteOptions): Promise<string>;
+  async completeJson<T>(prompt: string, options?: LmCompleteOptions): Promise<T>;
+  getCachePath(): string;
+  async preBake(entries: PreBakeEntry[]): Promise<void>;
+  static async loadPreBakedCache(bundlePath: string): Promise<void>;
+}
+```
+
+Also export these supporting types in the same file:
+
+```typescript
+export interface LmCompleteOptions {
+  cacheKey?: string;
+  timeoutMs?: number;  // defaults to 30000
+}
+
+export interface PreBakeEntry {
+  cacheKey: string;
+  response: string;
+}
+```
+
+**Private state:**
+
+```typescript
+private model: vscode.LanguageModelChat | null = null;
+```
 
 **Imports:**
 
 ```typescript
-import { execFile } from 'child_process';
-import { promisify } from 'util';
-import { FreshnessInfo } from '../types';
-
-const execFileAsync = promisify(execFile);
+import * as vscode from 'vscode';
+import * as fs from 'fs/promises';
+import * as path from 'path';
+import * as os from 'os';
+import * as crypto from 'crypto';
 ```
+
+Note: no imports from other project files. This module has no domain dependencies.
 
 ---
 
-## Behavior
-
-The method performs three computations independently and combines them into a `FreshnessInfo` result. Each computation has a fallback path so that a partial failure still produces a usable result.
-
-### Computation 1 — `ageDays`
-
-Compute the age of the manifest in days:
+## Method: `initialize`
 
 ```typescript
-const generatedMs = Date.parse(manifestGeneratedAt);
-const ageDays = isNaN(generatedMs)
-  ? 0
-  : Math.max(0, Math.floor((Date.now() - generatedMs) / 86400000));
+async initialize(): Promise<void>
 ```
 
-- Use `Math.floor` — a manifest generated 30 hours ago is 1 day old, not 2.
-- Use `Math.max(0, ...)` — a manifest with a future timestamp (clock skew, bad input) is treated as 0 days old, not negative.
-- Invalid ISO strings (`Date.parse` returns `NaN`) default to 0 days. Do not throw. This is a "best available data" module.
+Behavior:
+1. Call `vscode.lm.selectChatModels({ vendor: 'copilot' })`.
+2. If the returned array is empty, throw:
+   ```typescript
+   throw new Error(
+     'No Copilot chat model available. Install/sign in to GitHub Copilot and try again.'
+   );
+   ```
+3. Store `models[0]` on `this.model`.
+4. If `this.model` is already set (initialize called twice), return early without re-selecting.
 
-### Computation 2 — `commit`
-
-The short SHA displayed to the user:
-
-```typescript
-const commit = manifestCommit.length >= 7 ? manifestCommit.substring(0, 7) : manifestCommit;
-```
-
-- No git call needed for this — it's a pure string slice.
-- Preserve the input verbatim if it's shorter than 7 characters (defensive; shouldn't happen with real SHAs).
-
-### Computation 3 — `javaFilesChangedSince`
-
-This requires two git operations:
-
-**Step 3a — verify the commit exists in the repo.**
-
-Run:
-```typescript
-await execFileAsync('git', ['rev-parse', '--verify', `${manifestCommit}^{commit}`], { cwd: repoRoot });
-```
-
-The `^{commit}` suffix ensures the ref actually resolves to a commit object (not a tree or blob). If this command fails (non-zero exit, throws in the promisified form), the commit is not present in the repo — could be a shallow clone, a rebased-away commit, or a completely wrong SHA. In this case:
-
-```typescript
-return {
-  ageDays,
-  commit,
-  javaFilesChangedSince: -1,
-  flag: 'significantly_drifted',
-};
-```
-
-Also log a warning: ``console.warn(`FreshnessChecker: commit ${manifestCommit} not found in ${repoRoot}; treating as significantly_drifted.`);``
-
-Do not attempt Step 3b if 3a fails.
-
-**Step 3b — count changed Java files since the manifest commit.**
-
-Run:
-```typescript
-const { stdout } = await execFileAsync(
-  'git',
-  ['diff', '--name-only', `${manifestCommit}`, 'HEAD', '--', '*.java'],
-  { cwd: repoRoot }
-);
-```
-
-Parse the output:
-- Split on `\n`.
-- Filter out empty lines (empty strings, whitespace-only lines).
-- The count of remaining lines is `javaFilesChangedSince`.
-
-If this command fails for any reason (git errored out, output couldn't be read), log a warning and default to:
-
-```typescript
-javaFilesChangedSince = 0;
-// Continue with flag computation using this default.
-```
-
-Note the asymmetry: a missing-commit failure returns immediately with `-1`. A diff failure defaults to `0` and continues. This is intentional — if the commit exists but git got confused about the diff, we'd rather show the manifest as "fresh" than falsely flag it as drifted. False drift warnings train users to ignore the freshness banner.
-
-### Computing the `flag`
-
-Given `ageDays` and `javaFilesChangedSince`, determine the flag using these thresholds:
-
-```typescript
-let flag: 'fresh' | 'stale' | 'significantly_drifted';
-if (ageDays <= 7 && javaFilesChangedSince <= 5) {
-  flag = 'fresh';
-} else if (ageDays <= 30 || javaFilesChangedSince <= 20) {
-  flag = 'stale';
-} else {
-  flag = 'significantly_drifted';
-}
-```
-
-Read the boolean logic carefully — the second condition uses OR, not AND. This is intentional. A manifest is `stale` if EITHER the age is under 30 days OR fewer than 20 files have changed since. Only when both are exceeded does it fall through to `significantly_drifted`.
-
-The rationale: a manifest that's 40 days old but has only 3 file changes is stale (aged but the repo has been quiet — probably still accurate). A manifest that's 5 days old but has 50 file changes is also stale (young but the repo has churned). Only manifests that are BOTH aged AND churned are significantly drifted.
-
-### Assembling the result
-
-```typescript
-return {
-  ageDays,
-  commit,
-  javaFilesChangedSince,
-  flag,
-};
-```
+This method is called once per extension session, typically from `extension.ts` `activate` (lazily, on first LLM use).
 
 ---
 
-## Error handling summary
-
-The method NEVER throws. Every failure mode has a specific fallback:
-
-- Invalid `manifestGeneratedAt` (NaN from `Date.parse`) → `ageDays = 0`, continue.
-- Missing commit (rev-parse fails) → return early with `javaFilesChangedSince = -1`, `flag = 'significantly_drifted'`, log warning.
-- Diff command fails (other reasons) → `javaFilesChangedSince = 0`, continue with flag computation, log warning.
-- `execFile` throws for reasons other than the above (e.g. git not installed) → log warning, return `{ ageDays, commit, javaFilesChangedSince: -1, flag: 'significantly_drifted' }`.
-
-Wrap the entire method body in a try/catch as an outer safety net that returns the "worst case" result if something completely unexpected happens.
-
----
-
-## Implementation shell
+## Method: `complete`
 
 ```typescript
-export class FreshnessChecker {
-  async check(
-    repoRoot: string,
-    manifestCommit: string,
-    manifestGeneratedAt: string
-  ): Promise<FreshnessInfo> {
-    // Computation 1 — ageDays (pure)
-    const generatedMs = Date.parse(manifestGeneratedAt);
-    const ageDays = isNaN(generatedMs)
-      ? 0
-      : Math.max(0, Math.floor((Date.now() - generatedMs) / 86400000));
+async complete(prompt: string, options?: LmCompleteOptions): Promise<string>
+```
 
-    // Computation 2 — commit (pure)
-    const commit = manifestCommit.length >= 7 ? manifestCommit.substring(0, 7) : manifestCommit;
+Behavior:
 
-    // Computation 3 — javaFilesChangedSince (git)
-    let javaFilesChangedSince: number;
+**Step 1 — cache lookup.**
 
-    try {
-      await execFileAsync('git', ['rev-parse', '--verify', `${manifestCommit}^{commit}`], {
-        cwd: repoRoot,
-      });
-    } catch {
-      console.warn(
-        `FreshnessChecker: commit ${manifestCommit} not found in ${repoRoot}; treating as significantly_drifted.`
-      );
-      return { ageDays, commit, javaFilesChangedSince: -1, flag: 'significantly_drifted' };
-    }
+If `options?.cacheKey` is provided:
+- Compute cache path: `path.join(this.getCachePath(), `${options.cacheKey}.txt`)`.
+- Try to read the file. If it exists, return its contents verbatim (do not call the LLM).
+- If it doesn't exist, continue to Step 2. Do not treat missing cache as an error.
 
-    try {
-      const { stdout } = await execFileAsync(
-        'git',
-        ['diff', '--name-only', manifestCommit, 'HEAD', '--', '*.java'],
-        { cwd: repoRoot }
-      );
-      javaFilesChangedSince = stdout
-        .split('\n')
-        .map((l) => l.trim())
-        .filter((l) => l.length > 0).length;
-    } catch (err) {
-      console.warn(
-        `FreshnessChecker: git diff failed in ${repoRoot}: ${(err as Error).message}. Defaulting to 0 changed files.`
-      );
-      javaFilesChangedSince = 0;
-    }
+**Step 2 — ensure model is initialized.**
 
-    // Flag computation
-    let flag: 'fresh' | 'stale' | 'significantly_drifted';
-    if (ageDays <= 7 && javaFilesChangedSince <= 5) {
-      flag = 'fresh';
-    } else if (ageDays <= 30 || javaFilesChangedSince <= 20) {
-      flag = 'stale';
-    } else {
-      flag = 'significantly_drifted';
-    }
+If `this.model === null`, call `await this.initialize()`. If that throws, propagate.
 
-    return { ageDays, commit, javaFilesChangedSince, flag };
+**Step 3 — call the LLM with a timeout.**
+
+Build the message and send the request:
+```typescript
+const message = vscode.LanguageModelChatMessage.User(prompt);
+const cts = new vscode.CancellationTokenSource();
+const request = await this.model!.sendRequest([message], {}, cts.token);
+```
+
+Race the streaming against a timeout:
+```typescript
+const timeoutMs = options?.timeoutMs ?? 30000;
+const timeoutPromise = new Promise<never>((_, reject) => {
+  setTimeout(() => {
+    cts.cancel();
+    reject(new Error(`LLM request timed out after ${timeoutMs}ms`));
+  }, timeoutMs);
+});
+
+const streamPromise = (async () => {
+  let response = '';
+  for await (const chunk of request.text) {
+    response += chunk;
   }
+  return response;
+})();
+
+const response = await Promise.race([streamPromise, timeoutPromise]);
+```
+
+The `cts.cancel()` in the timeout path attempts to signal the underlying LLM call to abort.
+
+**Step 4 — cache write-back.**
+
+If `options?.cacheKey` was provided and the call succeeded:
+- Ensure the cache directory exists: `await fs.mkdir(this.getCachePath(), { recursive: true });`
+- Write the response: `await fs.writeFile(cachePath, response, 'utf-8');`
+- Do not fail the overall call if the write fails — log via `console.warn` and return the response anyway.
+
+**Step 5 — return.**
+
+Return the response string as-is (no trimming, no processing).
+
+**Error handling for `complete`:**
+
+- Timeout → the `Promise.race` throws the timeout error, which propagates to the caller.
+- LLM errors (Copilot returned an error, network issue) → let them propagate. The caller (typically a pipeline) is responsible for deciding whether to degrade gracefully.
+- Cache read errors (permission denied, etc, other than ENOENT) → log warning, treat as cache miss, continue to LLM call.
+- Cache write errors → log warning, still return the response.
+
+---
+
+## Method: `completeJson<T>`
+
+```typescript
+async completeJson<T>(prompt: string, options?: LmCompleteOptions): Promise<T>
+```
+
+Wraps `complete` for callers that need structured output.
+
+Behavior:
+
+**Step 1 — augment prompt.**
+
+Append this exact suffix to the prompt:
+```
+\n\nRespond with ONLY valid JSON. No markdown code fences, no prose, no preamble.
+```
+
+Call `complete(augmentedPrompt, options)`.
+
+**Step 2 — strip accidental code fences.**
+
+The LLM may still wrap its response in ```` ```json ```` fences despite instructions. Strip them:
+- If the response trimmed starts with ```` ```json ```` or ```` ``` ````, remove the opening fence line.
+- If it ends with ```` ``` ````, remove the closing fence line.
+- Use a robust regex or line-by-line strip — the response might have trailing whitespace or newlines around the fences.
+
+**Step 3 — parse JSON.**
+
+Try `JSON.parse(cleanedResponse)`. Return as `T`.
+
+**Step 4 — retry once on parse failure.**
+
+If `JSON.parse` throws:
+- Log warning: `console.warn('LmClient.completeJson: first attempt returned invalid JSON, retrying');`
+- Build a retry prompt by appending to the ORIGINAL prompt (not the augmented one, to avoid compounding suffixes):
+  ```
+  \n\nYour previous response was invalid JSON. Respond with ONLY the JSON object, no fences, no prose. Just the object, starting with { and ending with }.
+  ```
+- Call `complete(retryPrompt, options)` — note: bypass the cache on retry by passing `{ ...options, cacheKey: undefined }` so the retry actually re-queries the LLM.
+- Strip fences again.
+- `JSON.parse` again. If this throws too, throw an error with a message including both the raw response and the parse error:
+  ```typescript
+  throw new Error(
+    `LmClient.completeJson: failed to parse JSON after retry. ` +
+    `Raw response: ${cleanedResponse.substring(0, 500)}. ` +
+    `Parse error: ${(err as Error).message}`
+  );
+  ```
+
+---
+
+## Method: `getCachePath`
+
+```typescript
+getCachePath(): string
+```
+
+Returns the absolute path to the extension's cache directory:
+
+```typescript
+return path.join(os.homedir(), '.ai-change-impact-notifier', 'cache');
+```
+
+Synchronous. Does not create the directory — that's the caller's responsibility (or handled inside `complete`).
+
+---
+
+## Method: `preBake`
+
+```typescript
+async preBake(entries: PreBakeEntry[]): Promise<void>
+```
+
+Writes cache entries in bulk. Used by `loadPreBakedCache` and can also be called directly.
+
+Behavior:
+1. Ensure cache dir exists: `await fs.mkdir(this.getCachePath(), { recursive: true });`
+2. For each entry, write `${cachePath}/${entry.cacheKey}.txt` with `entry.response` as content.
+3. If any individual write fails, log a warning with the specific cacheKey and continue with the next. Do not abort the whole operation.
+
+---
+
+## Static method: `loadPreBakedCache`
+
+```typescript
+static async loadPreBakedCache(bundlePath: string): Promise<void>
+```
+
+Loads a bundled cache from a JSON file. Used at extension startup to seed the cache with pre-computed LLM responses for demo reliability.
+
+Behavior:
+1. Read the JSON file at `bundlePath`. On ENOENT, silently return (no bundle present is normal, not an error).
+2. Parse as `PreBakeEntry[]`. If parse fails, log warning and return.
+3. Validate: must be an array. Each entry must have `cacheKey: string` and `response: string`. Skip invalid entries with a warning.
+4. Create a temporary `LmClient` instance just to reuse `preBake`:
+   ```typescript
+   const client = new LmClient();
+   await client.preBake(validEntries);
+   ```
+5. Log a summary: `console.log(\`LmClient: loaded ${validEntries.length} pre-baked cache entries from ${bundlePath}\`);`
+
+Does not throw. All failures are logged and swallowed — the extension should function normally without a bundled cache.
+
+---
+
+## Utility: computing cache keys from prompts (optional helper)
+
+Since callers often want to derive a stable cache key from the prompt content itself, add a static helper:
+
+```typescript
+static hashPrompt(prompt: string): string {
+  return crypto.createHash('sha256').update(prompt).digest('hex').substring(0, 16);
 }
 ```
 
-Use this shell verbatim as your starting point. Wrap the entire method body in an outer try/catch for defense-in-depth, returning `{ ageDays, commit, javaFilesChangedSince: -1, flag: 'significantly_drifted' }` on any unexpected exception with a `console.warn` describing the failure.
-
-Add JSDoc comments on the class and the `check` method explaining the intent and the two failure modes.
+Callers can use this to generate cache keys like `narrative-${LmClient.hashPrompt(prompt)}`.
 
 ---
 
 ## Do not
 
-- Do not throw. Every path returns a valid `FreshnessInfo`.
-- Do not use `child_process.exec` or `execSync`. Use the promisified `execFile`.
-- Do not use shell metacharacters in the git commands (the `execFile` form takes an array of arguments — no shell interpolation).
-- Do not fetch or pull from the remote. Only local git operations.
-- Do not modify the repo state.
-- Do not use `fs` — no file I/O in this module.
-- Do not consult the manifest itself. This module receives the two fields (`manifestCommit` and `manifestGeneratedAt`) as arguments; it does not read `store.md`.
-- Do not import from any file other than `../types`.
+- Do not use `require(...)` — use ES imports.
+- Do not use the OpenAI SDK, Anthropic SDK, or any other LLM library.
+- Do not implement retry logic beyond the single JSON-parse retry described. Network retries are the LLM provider's job.
+- Do not attempt to detect model capabilities or filter by model name — `selectChatModels({ vendor: 'copilot' })` is enough for v1.
+- Do not add rate limiting.
+- Do not cache in-memory across calls beyond what the filesystem cache provides.
+- Do not throw from `loadPreBakedCache` — it must be safe to call unconditionally at startup.
+- Do not import from `../types` or any other project file.
+- Do not use `System` or `Assistant` messages in v1 — only `.User(prompt)`.
 
 ---
 
-## Expected freshness matrix
+## Skeleton to fill in
 
-For your reference — verify these produce the specified flags:
+```typescript
+import * as vscode from 'vscode';
+import * as fs from 'fs/promises';
+import * as path from 'path';
+import * as os from 'os';
+import * as crypto from 'crypto';
 
-| ageDays | javaFilesChangedSince | expected flag |
-|---|---|---|
-| 0 | 0 | `fresh` |
-| 5 | 3 | `fresh` |
-| 7 | 5 | `fresh` |
-| 8 | 3 | `stale` (age > 7) |
-| 5 | 8 | `stale` (files > 5) |
-| 25 | 10 | `stale` |
-| 40 | 3 | `stale` (age > 30 but files ≤ 20) |
-| 5 | 25 | `stale` (files > 5 but age ≤ 30) |
-| 45 | 25 | `significantly_drifted` (both exceeded) |
-| any | -1 | `significantly_drifted` (missing commit special case) |
+export interface LmCompleteOptions {
+  cacheKey?: string;
+  timeoutMs?: number;
+}
 
-Complete the file. This module is small (~60 lines with comments). Do not over-engineer.
+export interface PreBakeEntry {
+  cacheKey: string;
+  response: string;
+}
+
+export class LmClient {
+  private model: vscode.LanguageModelChat | null = null;
+
+  async initialize(): Promise<void> {
+    // ... per spec above
+  }
+
+  async complete(prompt: string, options?: LmCompleteOptions): Promise<string> {
+    // ... per spec above (cache lookup → init → LLM call with timeout → cache write → return)
+  }
+
+  async completeJson<T>(prompt: string, options?: LmCompleteOptions): Promise<T> {
+    // ... per spec above (augment prompt → complete → strip fences → parse → retry once on failure)
+  }
+
+  getCachePath(): string {
+    return path.join(os.homedir(), '.ai-change-impact-notifier', 'cache');
+  }
+
+  async preBake(entries: PreBakeEntry[]): Promise<void> {
+    // ... per spec above
+  }
+
+  static async loadPreBakedCache(bundlePath: string): Promise<void> {
+    // ... per spec above
+  }
+
+  static hashPrompt(prompt: string): string {
+    return crypto.createHash('sha256').update(prompt).digest('hex').substring(0, 16);
+  }
+}
+```
+
+Fill in each method body per the specifications above. Preserve the exact API shape shown in the "Critical" section for the `vscode.lm` calls — do not invent alternatives. Add JSDoc comments on each public method explaining its behavior in 2-3 lines. Complete the file.
