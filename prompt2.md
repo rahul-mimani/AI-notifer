@@ -1,285 +1,378 @@
-Create a new file `src/llm/Prompts.ts` that centralizes the LLM prompt templates used by the extension. This module is pure — it takes structured domain data and returns fully-formed prompt strings ready to be passed to `LmClient.complete` or `LmClient.completeJson`. It performs no I/O and calls no LLM itself.
+Create a new file `src/pipeline/GeneratePipeline.ts` that orchestrates the "Generate store.md" command's full flow: walk the workspace, run all extractors, get the git commit, call the LLM for prose, and write the manifest via `StoreWriter`. Also update `src/extension.ts` to register the command and wire it to this pipeline.
 
-Types are defined in `src/types.ts` (currently open). `LmClient` is in `src/llm/LmClient.ts` (also open) — do not import from it, but the shape of prompts you generate must match what `LmClient` expects (plain strings).
+Types are defined in `src/types.ts` (currently open). Parsers are in `src/parser/*.ts` (open). Store I/O is in `src/store/StoreWriter.ts` and `src/store/StoreReader.ts` (open). LLM client is in `src/llm/LmClient.ts` (open). Prompt builders are in `src/llm/Prompts.ts` (open). Extension entry is `src/extension.ts` (open).
 
 ---
 
-## Exports
+## Part 1 — Create `src/pipeline/GeneratePipeline.ts`
 
-Export these from this module:
+**Exports:**
 
 ```typescript
-export const PROMPT_VERSION = '1.0.0';
+export interface GenerateOptions {
+  force?: boolean;
+}
 
-export function buildStoreProsePrompt(surfaceSet: SurfaceSet, repoName: string): string;
-export function buildImpactNarrativePrompt(record: ImpactRecord): string;
-export function buildMigrationSuggestionPrompt(record: ImpactRecord, callSiteCode: string): string;
+export interface GenerateResult {
+  storeMdPath: string;
+  surfaceCounts: {
+    endpoints: number;
+    dtos: number;
+    beans: number;
+    httpCalls: number;
+    beanInjections: number;
+  };
+}
+
+export async function runGenerate(
+  workspaceRoot: string,
+  lmClient: LmClient,
+  wasmPath: string,
+  options?: GenerateOptions
+): Promise<GenerateResult>;
 ```
 
-That's it — no class, no default export, three named functions plus a constant.
+No class needed — this is a single async function.
 
 **Imports:**
 
 ```typescript
-import { SurfaceSet, ImpactRecord, RestEndpoint, BeanDefinition } from '../types';
+import * as fs from 'fs/promises';
+import * as path from 'path';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import { Parser, Language } from 'web-tree-sitter';
+import {
+  StoreManifest,
+  SurfaceSet,
+  RestEndpoint,
+  DtoType,
+  BeanDefinition,
+  HttpCallSite,
+  BeanInjection,
+} from '../types';
+import { RestExtractor } from '../parser/RestExtractor';
+import { DtoExtractor } from '../parser/DtoExtractor';
+import { BeanExtractor } from '../parser/BeanExtractor';
+import { HttpCallSiteExtractor } from '../parser/HttpCallSiteExtractor';
+import { StoreWriter } from '../store/StoreWriter';
+import { StoreReader } from '../store/StoreReader';
+import { LmClient } from '../llm/LmClient';
+import { buildStoreProsePrompt } from '../llm/Prompts';
+
+const execFileAsync = promisify(execFile);
 ```
 
 ---
 
-## `PROMPT_VERSION`
+### `runGenerate` — steps in order
 
-A hard-coded version string. Rev this manually when prompt content changes materially — the cache uses prompt content as the key, but if you materially change what a prompt asks for, you may want to invalidate old cache entries by bumping this and including it in cache keys upstream.
+**Step 1 — Initialize tree-sitter and load Java language.**
 
 ```typescript
-export const PROMPT_VERSION = '1.0.0';
+await Parser.init();
+const javaLang = await Language.load(wasmPath);
+const parser = new Parser();
+parser.setLanguage(javaLang);
 ```
 
----
+If `Parser.init()` throws or `Language.load` throws, log the error and rethrow with a clearer message like `"Failed to initialize tree-sitter Java parser: <original error>. Check that resources/tree-sitter-java.wasm exists."` The caller (extension.ts) will surface this to the user.
 
-## `buildStoreProsePrompt`
+**Step 2 — Discover Java source files.**
 
-**Signature:**
+Walk `${workspaceRoot}/src/main/java` recursively for files ending in `.java`. If `src/main/java` doesn't exist, fall back to walking `${workspaceRoot}` entirely and filter for `.java` files, but skip:
+- Any path segment named `test`, `tests`, `target`, `build`, `.git`, `node_modules`, or `.idea`.
+- Files under any directory whose name starts with `.`.
+
+Implement as a private async function:
+
 ```typescript
-export function buildStoreProsePrompt(surfaceSet: SurfaceSet, repoName: string): string
+async function walkJavaFiles(root: string): Promise<string[]>
 ```
 
-**Purpose:** Generates the prompt that asks the LLM to write the human-readable prose section of `store.md`. This becomes the `<!-- BEGIN AI-PROSE -->` block content.
+Use `fs.readdir(dir, { withFileTypes: true })` and recurse into directories. Return absolute paths.
 
-**Structure the returned prompt in this order:**
+If no `.java` files are found, do NOT throw — proceed with an empty `SurfaceSet`. The manifest will still be written, just with empty arrays. This is valid: a repo with no Java code produces an empty surface.
 
-1. **Framing line.**
-   ```
-   You are documenting a Spring Boot service named ${repoName}.
-   ```
+**Step 3 — Instantiate extractors.**
 
-2. **Extracted surface summary — compact bullets.** Enumerate the endpoints and beans in compact form. Skip DTOs (they're internal detail, not surface prose worth documenting).
-
-   Format the endpoints as one line each:
-   ```
-   - ${endpoint.method} ${endpoint.path} → ${endpoint.responseType}
-   ```
-
-   For beans:
-   ```
-   - ${bean.name} (${bean.type}) with methods: ${methodNames.join(', ')}
-   ```
-   Where `methodNames` is the list of `bean.publicMethods.map(m => m.name)`. If a bean has no public methods, use `"(no public methods)"` instead of an empty list.
-
-   Precede each list with a subheading:
-   ```
-   
-   ENDPOINTS:
-   <bullets>
-   
-   BEANS:
-   <bullets>
-   ```
-
-   If either list is empty, still include the subheading and write `(none)` beneath it. This tells the LLM the surface was extracted and is genuinely empty, versus omitted.
-
-3. **Instructions block.** Ask the LLM to write markdown with specific sections and constraints:
-
-   ```
-   
-   Write a concise markdown document describing this service. Use exactly these sections in this order:
-   
-   ## Overview
-   A 2-3 sentence description of what this service does, inferred from the endpoints and beans above. Do not speculate about business context beyond what the surface reveals.
-   
-   ## Endpoints
-   One line per endpoint. Format: `- \`${method} ${path}\` — <one-line description of likely purpose>`. Base the description on the path and response type. Do not invent request/response semantics not implied by the surface.
-   
-   ## Beans
-   One line per bean. Format: `- \`${beanName}\` — <one-line description of its role>`. If the bean has no public methods, note it as an internal collaborator.
-   
-   Constraints:
-   - Output only the markdown content. No preamble, no explanation, no code fences around the whole thing.
-   - Do not add sections beyond the three specified.
-   - Do not fabricate details. If the surface is minimal, keep the prose minimal.
-   - Do not include the repo name in a top-level # header. Start with `## Overview`.
-   ```
-
-**Do not use interpolated backticks inside the instructions block** in a way that would break the outer template literal — you'll need to escape them (e.g. `\`${method} ${path}\``) or use string concatenation for those specific lines.
-
-**Example output (for reference — for a repo with 2 endpoints and 1 bean):**
-
-```
-You are documenting a Spring Boot service named CDU.
-
-ENDPOINTS:
-- GET /api/v1/customer/{id} → CustomerResponse
-- POST /api/v1/customer → CustomerResponse
-
-BEANS:
-- customerService (com.example.cdu.service.CustomerService) with methods: getById, updatePhone
-
-Write a concise markdown document describing this service. Use exactly these sections in this order:
-
-## Overview
-[...instructions as above...]
-```
-
----
-
-## `buildImpactNarrativePrompt`
-
-**Signature:**
 ```typescript
-export function buildImpactNarrativePrompt(record: ImpactRecord): string
+const restExtractor = new RestExtractor(parser);
+const dtoExtractor = new DtoExtractor(parser);
+const beanExtractor = new BeanExtractor(parser);
+const httpExtractor = new HttpCallSiteExtractor(parser);
 ```
 
-**Purpose:** Generates the prompt that asks the LLM to write a 2-3 sentence narrative explaining an impact to the consumer owner. The LLM's response goes into `record.narrative`.
+**Step 4 — Run extractors on each file, accumulate into a SurfaceSet.**
 
-**Structure the returned prompt:**
-
-1. **Framing.**
-   ```
-   You are writing a 2-3 sentence impact notification for a Spring Boot developer whose service consumes another service and may be affected by a change.
-   ```
-
-2. **The change — structured details.** Emit these fields in labeled form:
-   ```
-   
-   CHANGE:
-   - Kind: ${record.changeEvent.kind}
-   - Surface: ${record.changeEvent.surfaceId}
-   - Severity: ${record.changeEvent.severity}
-   - Before: ${JSON.stringify(record.changeEvent.before)}
-   - After: ${JSON.stringify(record.changeEvent.after)}
-   ${record.changeEvent.riskFlags.length > 0 ? `- Risk flags: ${record.changeEvent.riskFlags.join(', ')}` : ''}
-   ```
-
-3. **The coupling and consumer's usage.**
-   ```
-   
-   COUPLING: ${record.coupling}
-   CONSUMER: ${record.consumer}
-   CALL SITE: ${record.callSite.file}:${record.callSite.line}
-   USED TARGET: ${record.usedTarget}
-   CONFIDENCE: ${record.usedTargetConfidence ?? 'none'}
-   ```
-
-4. **The resulting status.**
-   ```
-   
-   STATUS: ${record.status} (reasoning: ${record.reasoning.join(', ')})
-   ```
-
-5. **Instructions.**
-   ```
-   
-   Write a 2-3 sentence notification directed at the developer of ${record.consumer}. Requirements:
-   - Direct and technical. No hedging phrases like "you might want to" or "please consider".
-   - State clearly WHAT changed, WHERE in their code it matters (file:line), and WHAT the effect is.
-   - If the confidence is 'inferred' or 'unknown', say the impact "may" or "likely" apply rather than asserting it as fact.
-   - If the confidence is 'declared', state the impact as fact.
-   - No preamble, no sign-off. Plain text only. No markdown. 2-3 sentences, no more.
-   ```
-
-**Do not** include the raw JSON of the whole `ImpactRecord` in the prompt — enumerate the fields explicitly as above so the LLM doesn't get confused by shape variations.
-
-**Do not** include the LLM's own future narrative or migration suggestion in the prompt — those fields on `record` may be undefined at prompt-building time.
-
----
-
-## `buildMigrationSuggestionPrompt`
-
-**Signature:**
 ```typescript
-export function buildMigrationSuggestionPrompt(record: ImpactRecord, callSiteCode: string): string
+const surface: SurfaceSet = {
+  provides: { endpoints: [], dtos: [], beans: [] },
+  consumes: { httpCalls: [], beanInjections: [] },
+};
 ```
 
-**Purpose:** Generates the prompt that asks the LLM to suggest a concrete code change to the consumer as a unified diff. The LLM's response goes into `record.migrationSuggestion`.
+For each file path:
+- Read file content: `const src = await fs.readFile(filePath, 'utf-8');`
+- Compute a repo-relative path for storage in the manifest: `path.relative(workspaceRoot, filePath)`. Use this as the `file` field passed to extractors — do not pass absolute paths (they'd leak local user directories into the manifest).
+- Run each extractor. Wrap each call in a try/catch so one bad file doesn't abort the whole walk:
+  ```typescript
+  try {
+    surface.provides.endpoints.push(...restExtractor.extract(src, relPath));
+    surface.provides.dtos.push(...dtoExtractor.extract(src, relPath));
+    surface.provides.beans.push(...beanExtractor.extractProviders(src, relPath));
+    surface.consumes.httpCalls.push(...httpExtractor.extract(src, relPath));
+    surface.consumes.beanInjections.push(...beanExtractor.extractInjections(src, relPath));
+  } catch (err) {
+    console.warn(`GeneratePipeline: extractor failed on ${relPath}: ${(err as Error).message}`);
+  }
+  ```
 
-The `callSiteCode` argument is provided by the caller — typically 5 lines before and 5 lines after the affected call site, read from the consumer file. The caller is responsible for gathering this; this module does not read files.
+**Step 5 — Get the current git commit.**
 
-**Structure the returned prompt:**
+```typescript
+let currentCommit: string;
+try {
+  const { stdout } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: workspaceRoot });
+  currentCommit = stdout.trim();
+} catch (err) {
+  console.warn(`GeneratePipeline: git rev-parse failed: ${(err as Error).message}. Using placeholder commit.`);
+  currentCommit = 'unknown';
+}
+```
 
-1. **Framing.**
-   ```
-   You are suggesting a code change to a Spring Boot consumer service to adapt to a change in a provider service. Your output must be a unified diff patch, nothing else.
-   ```
+Do NOT fail the whole generate flow if git isn't available. Falling back to `"unknown"` is acceptable — the FreshnessChecker later will treat this as a missing commit and flag consumers accordingly.
 
-2. **The change — same block as narrative prompt.** Reuse the same labeled format:
-   ```
-   
-   CHANGE:
-   - Kind: ${record.changeEvent.kind}
-   - Surface: ${record.changeEvent.surfaceId}
-   - Before: ${JSON.stringify(record.changeEvent.before)}
-   - After: ${JSON.stringify(record.changeEvent.after)}
-   ```
+**Step 6 — Read existing store.md prose for preservation.**
 
-3. **The call site code.** Wrap in a fence so the LLM knows exactly what code to modify:
-   ```
-   
-   CALL SITE (${record.callSite.file}:${record.callSite.line}):
-   \`\`\`java
-   ${callSiteCode}
-   \`\`\`
-   ```
+```typescript
+const reader = new StoreReader();
+const existing = await reader.read(workspaceRoot);
+const existingProse = existing.prose;  // may be null if no existing file
+```
 
-4. **Instructions.**
-   ```
-   
-   Suggest the minimum code change to adapt this call site to the provider change. Requirements:
-   - Output a unified diff patch in standard format: `--- a/${filepath}`, `+++ b/${filepath}`, `@@ ... @@` hunk headers, `-` lines for removals, `+` lines for additions, unchanged context lines starting with a single space.
-   - Use the file path `${record.callSite.file}` in the `---` and `+++` headers.
-   - Only modify the call site region shown. Do not invent code changes elsewhere.
-   - If the change is a field removal and the consumer reads a now-missing field, suggest either removing the read or adapting to the new provider shape.
-   - If the change is a method signature change, adapt the arguments accordingly.
-   - Output ONLY the diff. No preamble, no explanation, no code fences around the whole diff (the diff itself uses --- and +++ lines, which is standard).
-   ```
+We only need the prose. The existing manifest content is discarded — we're regenerating it.
 
-**Handling the diff header path:** be aware that `record.callSite.file` may be relative or absolute depending on how the caller populated it. Emit it verbatim — the caller is responsible for path normalization if needed.
+**Step 7 — Call the LLM to generate new prose.**
+
+The prompt is built from the surface set:
+
+```typescript
+const repoName = path.basename(workspaceRoot);
+const prosePrompt = buildStoreProsePrompt(surface, repoName);
+```
+
+Compute a cache key so pre-baked runs work:
+
+```typescript
+const cacheKey = `prose-${repoName}-${LmClient.hashPrompt(prosePrompt)}`;
+```
+
+Then call the LLM with the cache key. On failure, fall back to existing prose or a placeholder:
+
+```typescript
+let prose: string;
+try {
+  prose = await lmClient.complete(prosePrompt, { cacheKey });
+} catch (err) {
+  console.warn(`GeneratePipeline: LLM call for prose failed: ${(err as Error).message}. Falling back.`);
+  prose = existingProse ?? '_(No description available — LLM call failed. Retry with the Generate command.)_';
+}
+```
+
+**Step 8 — Build the StoreManifest.**
+
+```typescript
+const manifest: StoreManifest = {
+  schemaVersion: 1,
+  repo: repoName,
+  generatedAt: new Date().toISOString(),
+  generatedFromCommit: currentCommit,
+  provides: surface.provides,
+  consumes: surface.consumes,
+};
+```
+
+**Step 9 — Write the manifest via StoreWriter.**
+
+```typescript
+const writer = new StoreWriter();
+await writer.write(manifest, prose, workspaceRoot, { force: options?.force });
+```
+
+If `StoreWriter.write` throws `StoreMdHasUncommittedChanges`, propagate as-is. The caller in extension.ts will catch it and prompt the user for confirmation.
+
+**Step 10 — Return the result.**
+
+```typescript
+return {
+  storeMdPath: path.join(workspaceRoot, 'store.md'),
+  surfaceCounts: {
+    endpoints: surface.provides.endpoints.length,
+    dtos: surface.provides.dtos.length,
+    beans: surface.provides.beans.length,
+    httpCalls: surface.consumes.httpCalls.length,
+    beanInjections: surface.consumes.beanInjections.length,
+  },
+};
+```
 
 ---
 
-## Style constraints for all three functions
+## Part 2 — Update `src/extension.ts`
 
-Every prompt built by this module must follow these rules — they exist to keep LLM output predictable across cache runs and demo dry runs:
+The existing `src/extension.ts` currently has only the smoke-test command (and possibly the temporary `testLmClient` command from Prompt 13's verification step). Preserve those and add:
 
-- **Deterministic content.** No timestamps, no random IDs, no environment-dependent values. Two invocations with identical inputs must produce identical prompts (this is what makes cache keys stable).
-- **No conversational tone in prompts.** Avoid "please", "could you", "would you mind". Direct instructions only.
-- **Explicit output format.** Every prompt ends with a clear instruction about output format (plain text, markdown, or diff). Never leave the format ambiguous.
-- **Explicit anti-preamble.** Every prompt includes "no preamble" or "no explanation" as instructions. LLMs love to say "Sure, here's the notification:" and this must be suppressed.
+1. A shared `LmClient` instance, lazily initialized on first use.
+2. A registration for a new command `ai-change-impact-notifier.generate`.
+
+**Add these imports at the top:**
+
+```typescript
+import * as path from 'path';
+import { LmClient } from './llm/LmClient';
+import { runGenerate } from './pipeline/GeneratePipeline';
+```
+
+**Inside `activate`, add a shared LmClient managed lazily:**
+
+```typescript
+let lmClient: LmClient | null = null;
+
+async function getLmClient(): Promise<LmClient> {
+  if (lmClient === null) {
+    lmClient = new LmClient();
+    await lmClient.initialize();
+  }
+  return lmClient;
+}
+```
+
+This ensures we don't force the user to have Copilot available at extension load time — only when they actually run a command that uses it.
+
+**Register the generate command:**
+
+```typescript
+const generateCmd = vscode.commands.registerCommand('ai-change-impact-notifier.generate', async () => {
+  // 1. Pick workspace folder
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders || folders.length === 0) {
+    vscode.window.showErrorMessage('AI Impact: Please open a workspace folder first.');
+    return;
+  }
+
+  let targetFolder: vscode.WorkspaceFolder;
+  if (folders.length === 1) {
+    targetFolder = folders[0];
+  } else {
+    const picked = await vscode.window.showQuickPick(
+      folders.map((f) => ({ label: f.name, folder: f })),
+      { placeHolder: 'Select the repo to generate store.md for' }
+    );
+    if (!picked) return;
+    targetFolder = picked.folder;
+  }
+
+  const workspaceRoot = targetFolder.uri.fsPath;
+  const wasmPath = path.join(context.extensionPath, 'resources', 'tree-sitter-java.wasm');
+
+  // 2. Progress notification and execution
+  try {
+    const client = await getLmClient();
+
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `AI Impact: Generating store.md for ${targetFolder.name}`,
+        cancellable: false,
+      },
+      async (progress) => {
+        progress.report({ message: 'Extracting surface...' });
+        try {
+          const result = await runGenerate(workspaceRoot, client, wasmPath);
+          progress.report({ message: 'Done.' });
+          vscode.window.showInformationMessage(
+            `store.md written to ${result.storeMdPath}. ` +
+            `Surface: ${result.surfaceCounts.endpoints} endpoints, ` +
+            `${result.surfaceCounts.dtos} DTOs, ` +
+            `${result.surfaceCounts.beans} beans, ` +
+            `${result.surfaceCounts.httpCalls} HTTP calls, ` +
+            `${result.surfaceCounts.beanInjections} bean injections.`
+          );
+        } catch (err: any) {
+          if (err.name === 'StoreMdHasUncommittedChanges') {
+            const choice = await vscode.window.showWarningMessage(
+              `store.md has uncommitted changes. Overwrite?`,
+              { modal: true },
+              'Overwrite',
+              'Cancel'
+            );
+            if (choice === 'Overwrite') {
+              progress.report({ message: 'Overwriting...' });
+              const result = await runGenerate(workspaceRoot, client, wasmPath, { force: true });
+              vscode.window.showInformationMessage(
+                `store.md overwritten at ${result.storeMdPath}.`
+              );
+            }
+          } else {
+            throw err;
+          }
+        }
+      }
+    );
+  } catch (err: any) {
+    vscode.window.showErrorMessage(`AI Impact: Generate failed: ${err.message}`);
+    console.error(err);
+  }
+});
+
+context.subscriptions.push(generateCmd);
+```
+
+---
+
+## Part 3 — Update `package.json`
+
+Add the new command to `contributes.commands`. Preserve existing entries (smoke test, testLmClient if still present):
+
+```json
+{
+  "command": "ai-change-impact-notifier.generate",
+  "title": "AI Impact: Generate store.md"
+}
+```
+
+Also add to `activationEvents`:
+
+```json
+"onCommand:ai-change-impact-notifier.generate"
+```
+
+Do NOT remove existing commands or activation events. Preserve the smoke-test and (if present) testLmClient registrations.
+
+---
+
+## Error handling philosophy for this prompt
+
+- Extractor failures on individual files are non-fatal (log and continue).
+- Missing `src/main/java` is non-fatal (fall back to full workspace walk).
+- Git errors are non-fatal (fall back to `"unknown"` commit).
+- LLM errors are non-fatal (fall back to existing prose or placeholder).
+- `StoreMdHasUncommittedChanges` is the ONE case that should propagate — the caller handles it with a confirmation prompt.
+- Any other unexpected error propagates and is caught at the command's outer try/catch, surfaced via `showErrorMessage`.
 
 ---
 
 ## Do not
 
-- Do not import from `LmClient` or call any LLM function. This module builds strings.
-- Do not read any files. `callSiteCode` is provided as an argument for the migration prompt.
-- Do not mutate the input arguments.
-- Do not throw. If a field is missing on `record` (should not happen with well-typed input, but defensive), substitute a sensible default like `"(unknown)"` and continue.
-- Do not include the `PROMPT_VERSION` constant in the prompt bodies. It's for cache invalidation, not model context.
-- Do not use different JSON serialization for `before`/`after` — always `JSON.stringify` with no indent (single-line).
-- Do not include any dynamic date, time, or random information in the prompt output.
+- Do not require `@types/web-tree-sitter` — use the runtime types the package provides via its own `.d.ts`.
+- Do not use `path.relative` with backslash-normalizing logic — the extension may run on Windows. Trust `path.relative` and `path.join` to handle separators correctly.
+- Do not use `context.extensionUri.fsPath` — use `context.extensionPath` (a string) for `path.join` compatibility.
+- Do not call `runGenerate` at extension activation time. It only runs when the user explicitly invokes the command.
+- Do not add configuration schema for the command — no user-facing config in v1.
+- Do not persist the LmClient across VS Code sessions (the `lmClient` variable resets on reload — that's fine).
+- Do not walk `node_modules` or `target` even if `src/main/java` fallback is triggered.
+- Do not include prose in the output beyond what the LLM returns.
+- Do not modify the workspace beyond writing `store.md` (no auto-commit, no auto-format).
 
----
-
-## Skeleton
-
-```typescript
-import { SurfaceSet, ImpactRecord, RestEndpoint, BeanDefinition } from '../types';
-
-export const PROMPT_VERSION = '1.0.0';
-
-export function buildStoreProsePrompt(surfaceSet: SurfaceSet, repoName: string): string {
-  // ... assemble per spec above
-}
-
-export function buildImpactNarrativePrompt(record: ImpactRecord): string {
-  // ... assemble per spec above
-}
-
-export function buildMigrationSuggestionPrompt(record: ImpactRecord, callSiteCode: string): string {
-  // ... assemble per spec above
-}
-```
-
-Fill in each function per the specifications. Use small local helpers if it improves readability (e.g. a `formatEndpointBullet(endpoint: RestEndpoint): string` helper). Keep them non-exported.
-
-Add JSDoc comments on each exported function explaining what LLM task it drives and what field of the domain object the LLM's response is destined for.
-
-Complete the file.
+Complete both files. Write clean, focused code. Add JSDoc comments on `runGenerate` and on the command handler explaining the flow.
