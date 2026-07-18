@@ -1,165 +1,184 @@
-Diagnose and fix a bug in `src/pipeline/GeneratePipeline.ts` where human-provided answers in `.ai-impact/store.answers.json` are correctly read but do not appear in the resulting `store.md`. The user answers a question by editing the answers file, re-runs the Generate command, and the answered URL or field set does not show up in the manifest under `consumes.httpCalls`.
+Add strategic diagnostic logging to `src/pipeline/AnalyzePipeline.ts` to diagnose why the Analyze command is producing zero producer changes and zero consumer impacts even when the user has visibly modified a DTO in the working tree. The logs must reveal at each stage: whether git detected uncommitted changes, what "before" and "after" surfaces were extracted, what the diff engine produced, and what the matcher correlated. Do not change any logic — only add logs.
 
-Types are in `src/types.ts` (open). The answers store is in `src/store/AnswersStore.ts` (open). The main pipeline is `src/pipeline/GeneratePipeline.ts` (open).
+Types are in `src/types.ts` (open). The pipeline is in `src/pipeline/AnalyzePipeline.ts` (open).
 
-## Two-part fix — do both
+All logs use the prefix `[DIAG-ANALYZE]` so they can be filtered in the debug console with a single filter string.
 
-### Part 1 — add diagnostic logs so we can see the flow
+## Step 1 — log the base/head detection
 
-At the top of `runGenerate` in `src/pipeline/GeneratePipeline.ts`, log the loaded answers:
+At the top of `runAnalyze`, after the git detection block that decides base and head refs:
 
 ```typescript
-console.log(`[DIAG-ANSWERS] Loaded ${existingAnswers.questions.length} existing questions from answers file`);
-const answered = existingAnswers.questions.filter(q => q.answer !== null && q.answer !== 'SKIP');
-console.log(`[DIAG-ANSWERS] Of those, ${answered.length} have answers`);
-for (const q of answered) {
-  console.log(`[DIAG-ANSWERS]   id=${q.id} kind=${q.kind} answer=${JSON.stringify(q.answer)} callSite=${q.callSite.file}:${q.callSite.line}`);
+console.log(`[DIAG-ANALYZE] providerRoot = ${providerRoot}`);
+console.log(`[DIAG-ANALYZE] consumerRoots = ${JSON.stringify(consumerRoots)}`);
+
+// After the git diff detection that sets baseRef / headRef:
+console.log(`[DIAG-ANALYZE] git base/head detection: baseRef=${baseRef}, headRef=${headRef}`);
+
+// Also log the raw output of the uncommitted-changes check for verification:
+try {
+  const { stdout: statusOut } = await execFileAsync(
+    'git',
+    ['status', '--porcelain', '--', '*.java'],
+    { cwd: providerRoot }
+  );
+  const uncommittedFiles = statusOut.split('\n').filter(l => l.trim().length > 0);
+  console.log(`[DIAG-ANALYZE] git status --porcelain returned ${uncommittedFiles.length} lines`);
+  for (const line of uncommittedFiles.slice(0, 20)) {
+    console.log(`[DIAG-ANALYZE]   ${line}`);
+  }
+} catch (err) {
+  console.log(`[DIAG-ANALYZE] git status failed: ${(err as Error).message}`);
 }
 ```
 
-In the URL-gap loop (where each `outcome` in `urlOutcomes` is processed), inside the loop body, immediately AFTER computing `questionId`:
+This tells us definitively whether git sees the user's uncommitted changes, and what the pipeline decided to diff against. If `headRef` is `HEAD` instead of `working-tree` when the user has visibly modified files, the detection is broken — that alone explains zero changes.
+
+## Step 2 — log the working-tree file walk
+
+Wherever `walkJavaFiles` is called for the working-tree extraction (or the equivalent function name from GeneratePipeline that AnalyzePipeline reuses):
 
 ```typescript
-const rawExpr = outcome.callSite.resolutionHint?.needsUrlResolution?.rawExpression ?? '';
-const questionId = AnswersStore.computeQuestionId(
-  'url',
-  { file: outcome.callSite.file, line: outcome.callSite.line },
-  rawExpr
+const workingTreeFiles = await walkJavaFiles(providerRoot);
+console.log(`[DIAG-ANALYZE] Working tree walk: found ${workingTreeFiles.length} .java files under ${providerRoot}`);
+
+const filesOfInterest = workingTreeFiles.filter(f =>
+  /Response\.java$/.test(f) || /Request\.java$/.test(f) || /Dto\.java$/i.test(f) || /Controller\.java$/.test(f)
 );
-
-console.log(`[DIAG-ANSWERS] URL gap at ${outcome.callSite.file}:${outcome.callSite.line}`);
-console.log(`[DIAG-ANSWERS]   rawExpression = "${rawExpr}"`);
-console.log(`[DIAG-ANSWERS]   computed questionId = ${questionId}`);
-const existingQ = existingAnswers.questions.find(q => q.id === questionId);
-console.log(`[DIAG-ANSWERS]   existingQ found = ${existingQ ? 'YES' : 'NO'}`);
-if (existingQ) {
-  console.log(`[DIAG-ANSWERS]   existingQ.answer = ${JSON.stringify(existingQ.answer)}`);
+console.log(`[DIAG-ANALYZE] Working tree files of interest (Response/Request/Dto/Controller): ${filesOfInterest.length}`);
+for (const f of filesOfInterest.slice(0, 15)) {
+  console.log(`[DIAG-ANALYZE]   ${f}`);
 }
 ```
 
-Then inside the "human answer present" branch, log the application:
+## Step 3 — log the git-base file listing
+
+Wherever the pipeline uses `git ls-tree` to list files at `baseRef`:
 
 ```typescript
-if (existingQ?.answer && existingQ.answer !== 'SKIP' && typeof existingQ.answer === 'string') {
-  console.log(`[DIAG-ANSWERS]   APPLYING answer to callSite.path = "${existingQ.answer}"`);
-  outcome.callSite.path = existingQ.answer;
-  delete outcome.callSite.resolutionHint?.needsUrlResolution;
-  delete outcome.callSite.omittedReason;   // critical — see Part 2
-  console.log(`[DIAG-ANSWERS]   After apply: path=${outcome.callSite.path}, omittedReason=${outcome.callSite.omittedReason}, hint=${JSON.stringify(outcome.callSite.resolutionHint)}`);
-  // ... existing push to newQuestions
-  continue;
-}
-```
-
-In the field-gap loop, do the same shape of logs. Log the raw expression / responseType, the computed questionId, whether an existing question was found, its answer, and log after applying.
-
-At the point where the surface is filtered before writing store.md, log what's being kept vs dropped:
-
-```typescript
-const beforeFilterCalls = surface.consumes.httpCalls.length;
-const droppedCalls = surface.consumes.httpCalls.filter(cs => cs.omittedReason);
-console.log(`[DIAG-ANSWERS] Filter step: ${beforeFilterCalls} httpCalls before filter, ${droppedCalls.length} to drop`);
-for (const dc of droppedCalls) {
-  console.log(`[DIAG-ANSWERS]   dropping ${dc.file}:${dc.line} path="${dc.path}" reason=${dc.omittedReason}`);
-}
-surface.consumes.httpCalls = surface.consumes.httpCalls.filter(cs => !cs.omittedReason);
-console.log(`[DIAG-ANSWERS] After filter: ${surface.consumes.httpCalls.length} httpCalls`);
-```
-
-Do the same for `beanInjections` if they have `omittedReason` handling.
-
-### Part 2 — apply the most likely fixes
-
-The bug is almost certainly one or more of these three. Fix all three at once — they're small and cheap.
-
-**Fix A — clear `omittedReason` when applying a human answer.**
-
-The pipeline likely sets `omittedReason: 'question_pending'` early as a defensive default when the gap is detected, and the "answer found" branches don't clear it. When the filter step runs, the callSite is dropped because `omittedReason` is still set.
-
-In the URL-gap loop, "human answer present" branch, add:
-
-```typescript
-delete outcome.callSite.omittedReason;
-```
-
-In the "LLM auto-resolved" branch, same:
-
-```typescript
-delete outcome.callSite.omittedReason;
-```
-
-In the field-gap loop, do both branches. And any other place where a gap is being marked as resolved (either by human answer or LLM provenance), explicitly clear `omittedReason`.
-
-**Fix B — question ID stability.**
-
-Verify `AnswersStore.computeQuestionId` does NOT include the line number in the hash material. Line numbers shift when unrelated code changes, and if the ID includes the line, a small edit invalidates every answer.
-
-Open `src/store/AnswersStore.ts`. If `computeQuestionId` looks like this:
-
-```typescript
-static computeQuestionId(kind, callSite, sourceContext) {
-  const material = `${kind}|${callSite.file}|${callSite.line}|${sourceContext}`;  // BAD - includes line
-  // ...
-}
-```
-
-Change to:
-
-```typescript
-static computeQuestionId(kind, callSite, sourceContext) {
-  const material = `${kind}|${callSite.file}|${sourceContext}`;  // GOOD - no line
-  // ...
-}
-```
-
-Also verify: the `sourceContext` passed to `computeQuestionId` from the pipeline should be the RAW EXPRESSION or a small identifying signature, NOT the full 10-line context (which might change if surrounding code shifts). If the pipeline passes the full context, change it to pass just the raw expression string for URL gaps, and `responseType + responseVarName` for field gaps.
-
-Specifically, in the URL-gap loop, the third argument to `computeQuestionId` should be the rawExpression:
-
-```typescript
-const questionId = AnswersStore.computeQuestionId(
-  'url',
-  { file: outcome.callSite.file, line: outcome.callSite.line },
-  rawExpr   // just the raw expression, NOT the multi-line context
+const { stdout: fileList } = await execFileAsync(
+  'git',
+  ['ls-tree', '-r', '--name-only', baseRef, '--', '*.java'],
+  { cwd: providerRoot }
 );
-```
-
-For field gaps:
-
-```typescript
-const questionId = AnswersStore.computeQuestionId(
-  'used_fields',
-  { file: outcome.callSite.file, line: outcome.callSite.line },
-  `${outcome.callSite.responseType}|${outcome.callSite.resolutionHint?.needsFieldResolution?.responseVarName}`
+const baseFiles = fileList.split('\n').map(l => l.trim()).filter(l => l.endsWith('.java'));
+console.log(`[DIAG-ANALYZE] git ls-tree ${baseRef}: found ${baseFiles.length} .java files at base ref`);
+const baseFilesOfInterest = baseFiles.filter(f =>
+  /Response\.java$/.test(f) || /Request\.java$/.test(f) || /Dto\.java$/i.test(f) || /Controller\.java$/.test(f)
 );
-```
-
-The user-facing `sourceContext` in the ResolutionQuestion object can still be the full 10-line context (for their reference when reading the question) — but the ID hash should use only the stable identifying material.
-
-**Fix C — file-path canonicalization.**
-
-The `callSite.file` used in ID computation might be absolute in one run and relative in another (or use different path separators on Windows). Canonicalize before hashing:
-
-```typescript
-static computeQuestionId(kind: string, callSite: { file: string; line: number }, sourceContext: string): string {
-  const canonicalFile = callSite.file.replace(/\\/g, '/');  // normalize Windows paths
-  const material = `${kind}|${canonicalFile}|${sourceContext}`;
-  return crypto.createHash('sha256').update(material).digest('hex').substring(0, 12);
+console.log(`[DIAG-ANALYZE] Base ref files of interest: ${baseFilesOfInterest.length}`);
+for (const f of baseFilesOfInterest.slice(0, 15)) {
+  console.log(`[DIAG-ANALYZE]   ${f}`);
 }
 ```
 
-If `callSite.file` might be absolute vs relative, strip everything up to and including `src/` for stability:
+## Step 4 — log the per-surface extraction counts
+
+After the "before" extraction completes:
 
 ```typescript
-const canonicalFile = callSite.file.replace(/\\/g, '/').replace(/^.*?\/src\//, 'src/');
+console.log(`[DIAG-ANALYZE] BEFORE surface counts: endpoints=${beforeSurface.provides.endpoints.length}, dtos=${beforeSurface.provides.dtos.length}, beans=${beforeSurface.provides.beans.length}`);
 ```
 
-Only apply this canonicalization if you're actually seeing path variation between runs. If the pipeline consistently passes repo-relative paths, plain `replace(/\\/g, '/')` is enough.
+After the "after" extraction completes:
+
+```typescript
+console.log(`[DIAG-ANALYZE] AFTER surface counts: endpoints=${afterSurface.provides.endpoints.length}, dtos=${afterSurface.provides.dtos.length}, beans=${afterSurface.provides.beans.length}`);
+```
+
+If BEFORE and AFTER counts are identical AND small (like 0 or a handful when the repo actually has dozens), the extractor is failing on both sides for the same reason — likely a shared bug in the "read a file's content and pass to extractor" step. If BEFORE is 0 but AFTER is populated, the git-base extraction is broken. If both are populated but identical, the DTO diff isn't detecting the modified DTOs.
+
+## Step 5 — log specific DTOs of interest from each surface
+
+After both extractions, find a DTO the user likely edited (any DTO with "Response" in its name) and log its state on both sides:
+
+```typescript
+const targetDtoPattern = /Response$/;
+const beforeDtos = beforeSurface.provides.dtos.filter(d => targetDtoPattern.test(d.fqName.split('.').pop() ?? ''));
+const afterDtos = afterSurface.provides.dtos.filter(d => targetDtoPattern.test(d.fqName.split('.').pop() ?? ''));
+
+console.log(`[DIAG-ANALYZE] DTOs matching *Response in BEFORE: ${beforeDtos.length}`);
+for (const d of beforeDtos.slice(0, 10)) {
+  console.log(`[DIAG-ANALYZE]   ${d.fqName} — ${d.fields.length} fields: [${d.fields.map(f => f.name).join(', ')}]`);
+}
+
+console.log(`[DIAG-ANALYZE] DTOs matching *Response in AFTER: ${afterDtos.length}`);
+for (const d of afterDtos.slice(0, 10)) {
+  console.log(`[DIAG-ANALYZE]   ${d.fqName} — ${d.fields.length} fields: [${d.fields.map(f => f.name).join(', ')}]`);
+}
+```
+
+This shows the field lists on each side. If both are identical for the DTO the user modified, that's the smoking gun — extraction is producing the same result despite the working tree change.
+
+## Step 6 — log the diff result
+
+Right after `diffEngine.diff` returns:
+
+```typescript
+console.log(`[DIAG-ANALYZE] DiffEngine returned ${changes.length} ChangeEvents`);
+const changeKindCounts = new Map<string, number>();
+for (const c of changes) {
+  changeKindCounts.set(c.kind, (changeKindCounts.get(c.kind) ?? 0) + 1);
+}
+for (const [kind, count] of changeKindCounts) {
+  console.log(`[DIAG-ANALYZE]   ${kind}: ${count}`);
+}
+
+// Show first 5 changes in detail:
+for (const c of changes.slice(0, 5)) {
+  console.log(`[DIAG-ANALYZE]   change: kind=${c.kind}, surfaceId=${c.surfaceId}, severity=${c.severity}`);
+}
+```
+
+## Step 7 — log matcher results per consumer
+
+Inside the consumer loop, after `matchHttp` and `matchBean`:
+
+```typescript
+console.log(`[DIAG-ANALYZE] Consumer ${manifest.repo}: manifest has ${manifest.consumes.httpCalls.length} httpCalls, ${manifest.consumes.beanInjections.length} beanInjections`);
+console.log(`[DIAG-ANALYZE]   matchHttp returned ${httpMatches.length} matches`);
+console.log(`[DIAG-ANALYZE]   matchBean returned ${beanMatches.length} matches`);
+
+// For each http match, log the details:
+for (const m of httpMatches.slice(0, 10)) {
+  console.log(`[DIAG-ANALYZE]     httpMatch: change=${m.change.kind}/${m.change.surfaceId}, callSite=${m.callSite.file}:${m.callSite.line}, usedField=${m.usedField ? m.usedField.path : 'null'}`);
+}
+```
+
+## Step 8 — log final impact record counts
+
+Before returning the report:
+
+```typescript
+const totalImpacts = consumerImpacts.reduce((sum, c) => sum + c.impacts.length, 0);
+const breakingCount = consumerImpacts.flatMap(c => c.impacts).filter(i => i.status === 'breaking').length;
+const reviewCount = consumerImpacts.flatMap(c => c.impacts).filter(i => i.status === 'review_recommended').length;
+const safeCount = consumerImpacts.flatMap(c => c.impacts).filter(i => i.status === 'safe').length;
+
+console.log(`[DIAG-ANALYZE] Final report: ${changes.length} producer changes, ${consumersScanned} consumers scanned, ${totalImpacts} total impacts (${breakingCount} breaking, ${reviewCount} review, ${safeCount} safe)`);
+```
 
 ## Do not
 
-- Do not remove existing behavior. The three fixes above are purely additive/corrective.
-- Do not modify the answers file schema.
-- Do not change how the answers file is read or written — the AnswersStore code is likely correct.
-- Do not touch StoreWriter, StoreReader, or any downstream module.
-- Do not throw. Preserve all existing try/catch blocks.
+- Do not change any logic. Only add logs.
+- Do not modify how base/head refs are detected. If detection is broken, we'll fix it based on the log output.
+- Do not modify the extractors, diff engine, or matcher.
+- Do not remove existing behavior.
+- Do not throw new errors.
+
+## Instructions to the user after applying
+
+Reload the extension window, open the debug console (Help → Toggle Developer Tools → Console), filter for `[DIAG-ANALYZE]`, run Analyze on CDU with your uncommitted DTO changes, then paste back:
+
+1. The full sequence of `[DIAG-ANALYZE]` lines from the console.
+2. The generated report JSON.
+
+The two together will pinpoint exactly which stage is producing empty output. Most likely explanations, in order of likelihood:
+
+- **`baseRef=HEAD~1, headRef=HEAD`** instead of `HEAD` and `working-tree` → the uncommitted-changes detection failed. Bug in the git status parsing.
+- **`git ls-tree` returns 0 files at base ref** → the base ref doesn't exist (fresh repo or shallow clone). Fallback to empty before-surface not working correctly.
+- **BEFORE and AFTER DTO field lists are identical** for the file you changed → extractor is producing the same output. Most likely cause: the "after" extraction is reading from git instead of working tree, OR the "before" extraction is reading from working tree instead of git.
+- **DiffEngine returns 0 changes despite different field lists** → bug in the diff engine's DTO comparison logic.
+- **Matches array is empty despite changes and consumer manifest** → path normalization or fqName mismatch.
+
+Complete the modifications. The logs are strategic — keep them in the final build.
