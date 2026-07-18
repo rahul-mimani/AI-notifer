@@ -1,210 +1,254 @@
-Create a new file src/matcher/PathNormalizer.ts that exports a pure function for normalizing HTTP path strings into a single canonical form. This is the single point where cross-repo path joins happen — provider paths (from Spring annotations) and consumer paths (from URL literals, concatenations, and String.format calls) must both normalize to the same canonical shape so the matcher can join them by string equality.
+Create a new file src/matcher/Matcher.ts that joins provider-side ChangeEvents against consumer-side StoreManifest entries to produce matched pairs. This is the correlation step — no scoring, no LLM, no narrative. Just: "for this change on the provider, which consumer call sites and injection points are affected?"
 
-This module has no dependencies on any other file in the project. It does not import from src/types.ts — but keeping that file open gives Copilot the domain context.
+Types are defined in src/types.ts (currently open). Path normalization is in src/matcher/PathNormalizer.ts (also open). StoreManifest shape reference is in src/store/StoreReader.ts (also open). Import from those files as needed.
 
-Exports:
+Class shape:
 
-typescriptexport function normalizePath(path: string, kind: 'provider' | 'consumer'): string;
+Export a class Matcher with two public methods, no shared state:
 
-No class. No default export. Just the one named function.
+typescriptmatchHttp(
+  changes: ChangeEvent[],
+  consumerManifest: StoreManifest
+): HttpMatch[];
 
+matchBean(
+  changes: ChangeEvent[],
+  consumerManifest: StoreManifest
+): BeanMatch[];
 
-Canonical form
+Also export these result types:
 
-The output of normalizePath is a plain path string where:
-
-
-All variable segments are represented as the literal three-character sequence {}.
-No trailing slash (unless the entire path is just /).
-No query string.
-Case is preserved.
-
-
-Examples of the canonical form:
-
-
-/customer/{}
-/orders/{}/items
-/api/v1/customer/{}/orders/{}
-/customer (no variables)
-/ (root path)
-"" (empty input, empty output)
-
-
-
-Rules for both kinds
-
-Applied before kind-specific processing:
-
-
-If the input contains ?, discard everything from the first ? onward.
-Strip trailing whitespace.
-Case-sensitive throughout — do not lowercase.
-
-
-Applied after kind-specific processing:
-
-
-Strip the trailing / unless the entire result is /.
-
-
-
-Provider kind
-
-Input is the path as written in a Spring annotation. Convert any {anyName} segment to {}.
-
-Examples:
-
-
-"/customer/{id}" → /customer/{}
-"/orders/{orderId}/items" → /orders/{}/items
-"/orders/{orderId}/items/{itemId}" → /orders/{}/items/{}
-"/customer" → /customer
-"/" → /
-"" → ""
-"/customer?foo=bar" → /customer (query stripped)
-"/x/" → /x (trailing slash stripped)
-
-
-Implement with a regex: replace /\{[^}]+\}/g with {}. The character class inside must reject } to avoid greedy matching across segments.
-
-
-Consumer kind
-
-Input is the raw path/URL fragment as it appeared in the consumer source code. This can be any of these shapes because the HttpCallSiteExtractor may pass through several forms. Handle each:
-
-Shape 1 — already templated with Spring-style braces:
-
-
-"/customer/{id}" → /customer/{}
-Same rule as provider.
-
-
-Shape 2 — string concatenation as a literal source fragment:
-
-
-'"/customer/" + id' → /customer/{}
-'"/customer/" + var + "/items"' → /customer/{}/items
-'"/customer/" + a + "/orders/" + b' → /customer/{}/orders/{}
-
-
-Algorithm:
-
-
-Split the input on the + operator.
-For each piece, trim whitespace.
-If the piece starts and ends with ", it's a string literal — take its inner content.
-Otherwise, it's a variable or expression — replace with {}.
-Concatenate all pieces.
-
-
-Shape 3 — String.format call as a literal source fragment:
-
-
-'String.format("/customer/%s", var)' → /customer/{}
-'String.format("/customer/%d/orders/%s", a, b)' → /customer/{}/orders/{}
-'"/customer/%s"' (a lone format template) → /customer/{}
-
-
-Algorithm:
-
-
-Detect String.format(...) syntax with a regex like /^String\.format\(\s*"([^"]+)"/. Extract the format string inside the first argument.
-If not a String.format call but the input contains % format specifiers inside quotes, still process the specifiers.
-Replace every occurrence of % followed by a single letter (from the set s, d, f, x, b, c, o, e, g, n — cover the common Java format specifiers) with {}. Use regex /%[sdfxbcoegn]/g.
-Also handle width specifiers like %3d or %.2f: extend the regex to /%[-+#0-9.]*[sdfxbcoegn]/g.
-
-
-Shape 4 — plain string literal already stripped of quotes:
-
-
-"/customer/{id}" (arrived without quotes) → /customer/{}
-This is the same as Shape 1 or provider.
-
-
-Shape 5 — bare quoted string like '"/customer/x"':
-
-
-The input starts and ends with ". Strip quotes, then process normally.
-
-
-
-URL-to-path stripping
-
-If the input (after any of the above processing) starts with a scheme like http:// or https://, strip the scheme and host:
-
-
-Locate :// in the string.
-After ://, find the next /. Everything from that / onward is the path.
-If there is no / after the host, the path is /.
-
-
-Apply this after shape-specific processing but before the trailing-slash strip. This handles cases where the extractor passed a full URL by accident.
-
-
-Detection heuristics for consumer shape
-
-Since the caller doesn't tell you which shape the input is, detect in order:
-
-
-If input contains String.format( — Shape 3.
-Else if input contains + with " characters — Shape 2.
-Else if input contains % format specifiers — Shape 3 (lone format template).
-Else if input starts and ends with " — Shape 5 (strip quotes and recurse).
-Else — Shape 1/4 (treat as plain path with possible {name} variables).
-
-
-
-Implementation shell
-
-typescriptexport function normalizePath(path: string, kind: 'provider' | 'consumer'): string {
-  if (typeof path !== 'string') return '';
-
-  // Step 1: strip query string
-  let p = path.split('?')[0].trimEnd();
-
-  // Step 2: kind-specific processing
-  if (kind === 'provider') {
-    p = p.replace(/\{[^}]+\}/g, '{}');
-  } else {
-    p = normalizeConsumerPath(p);
-  }
-
-  // Step 3: strip scheme and host if URL
-  p = stripSchemeAndHost(p);
-
-  // Step 4: strip trailing slash (unless root)
-  if (p.length > 1 && p.endsWith('/')) {
-    p = p.slice(0, -1);
-  }
-
-  return p;
+typescriptexport interface HttpMatch {
+  change: ChangeEvent;
+  callSite: HttpCallSite;
+  usedField: UsedField | null;
 }
 
-Add the helpers normalizeConsumerPath(input: string): string and stripSchemeAndHost(input: string): string as private (non-exported) top-level functions in the same file. Keep each helper small and focused.
+export interface BeanMatch {
+  change: ChangeEvent;
+  injection: BeanInjection;
+  calledMethod: CalledMethod | null;
+}
+
+Imports:
+
+typescriptimport {
+  ChangeEvent,
+  StoreManifest,
+  HttpCallSite,
+  UsedField,
+  BeanInjection,
+  CalledMethod,
+} from '../types';
+import { normalizePath } from './PathNormalizer';
 
 
-Edge cases to handle explicitly
+matchHttp — HTTP coupling
+
+Iterate changes. For each change, determine whether it targets an HTTP surface (endpoint-level or DTO-field-level where the DTO is used as a response type by a consumer call site). Skip anything else.
+
+Two categories of HTTP-relevant change
+
+Category 1 — endpoint-level changes. change.surfaceKind === 'endpoint'.
+
+The surfaceId is formatted as ${method}:${normalizedPath}, e.g. "GET:/customer/{}".
+
+For each such change:
 
 
-Empty string input → empty string output.
-Input of just / → / (do not strip to empty).
-Input with only variables, no static segments ("{id}") → {}.
-Multiple consecutive slashes ("/x//y") → collapse is NOT required for v1; leave as-is.
-Windows-style backslashes → do NOT convert; treat backslash as any other character.
-Whitespace inside the path ("/customer /{id}") → preserve verbatim (don't try to clean).
+Split surfaceId on the first : to get changeMethod and changePath.
+Normalize changePath via normalizePath(changePath, 'provider').
+Iterate consumerManifest.consumes.httpCalls. For each callSite:
+
+Skip if callSite.method !== changeMethod.
+Normalize callSite.path via normalizePath(callSite.path, 'consumer').
+If the normalized paths are equal (string equality after both normalizations), emit:
+typescript{ change, callSite, usedField: null }
 
 
 
-Do not:
 
 
-Do not import anything from other project files.
-Do not export any additional utilities or types.
-Do not throw on any input. Non-string inputs return "".
-Do not lowercase, uppercase, or otherwise transform case.
-Do not attempt to parse the input as a URL with new URL(...) — the input is often malformed source-code fragments, not real URLs.
-Do not attempt to canonicalize . or .. segments.
+usedField is always null for endpoint-level matches — the whole endpoint is affected, not a specific field.
 
 
-Complete the file. Write focused, well-commented code. This module is the single point where cross-repo joins can silently fail — clarity and correctness matter more than brevity.
+Category 2 — DTO field-level changes. change.surfaceKind === 'dto'.
+
+The surfaceId for these events is formatted as ${dtoFqName}.${fieldName}, e.g. "com.example.cdu.dto.CustomerResponse.phone".
+
+For each such change:
+
+
+Split the surfaceId on the last . to get dtoFqName and changedFieldName.
+
+Use lastIndexOf('.') — the FQN itself contains dots.
+
+
+
+Extract the simple name of the DTO from dtoFqName — everything after the final . of the package part. For "com.example.cdu.dto.CustomerResponse" → "CustomerResponse".
+Iterate consumerManifest.consumes.httpCalls. For each callSite:
+
+Skip unless callSite.responseType equals the DTO simple name OR the FQN (best-effort — consumer manifests may store either form).
+Iterate callSite.usedFields. For each usedField:
+
+Check whether usedField.path ends with .${changedFieldName} (case-sensitive). Also match the exact string "response.${changedFieldName}" explicitly — this is the canonical form the extractor emits.
+If matched, emit:
+typescript{ change, callSite, usedField }
+
+
+
+
+
+If no usedField matched, do NOT emit a bare { change, callSite, usedField: null } for a DTO-field-level change — the consumer doesn't use the changed field, so it's not affected. This is intentional: it's the precision guardrail. Only emit when there's a concrete field-use match.
+
+
+
+
+
+Aggregation and return
+
+
+Return a flat array of all HttpMatch entries produced.
+Order is not significant; iteration order (changes × callSites × usedFields) is fine.
+Do not deduplicate across changes — the same callSite may legitimately match multiple changes.
+
+
+
+matchBean — bean coupling
+
+Iterate changes. For each change with change.surfaceKind === 'bean', correlate against consumerManifest.consumes.beanInjections.
+
+Two categories of bean-relevant change
+
+Category 1 — bean-level changes. change.kind is one of:
+
+
+BEAN_ADDED — skip (additive, no impact on existing consumers)
+BEAN_REMOVED
+BEAN_RENAMED
+BEAN_QUALIFIER_CHANGED
+BEAN_CONDITIONAL_TIGHTENED
+
+
+The surfaceId for bean-level events is the bean name (e.g. "customerService"). The bean's type (FQN of the class or return type) is stored in change.before and/or change.after — access via (change.before as any)?.type or the equivalent from after.
+
+For each such change:
+
+
+Extract beanType = (change.before as { type?: string })?.type ?? (change.after as { type?: string })?.type. If neither exists or beanType is empty, skip this change (defensive — should not happen with well-formed events).
+Iterate consumerManifest.consumes.beanInjections. For each injection:
+
+If injection.providerType === beanType, emit:
+typescript{ change, injection, calledMethod: null }
+
+
+
+
+
+calledMethod is always null for bean-level matches.
+
+
+Category 2 — bean-method-level changes. change.kind is one of:
+
+
+BEAN_METHOD_ADDED — skip (additive)
+BEAN_METHOD_REMOVED
+BEAN_METHOD_SIGNATURE_CHANGED
+
+
+The surfaceId for these events is formatted as ${beanName}#${methodName}, e.g. "customerService#getById". The bean's type is in change.before or change.after.
+
+For each such change:
+
+
+Split surfaceId on # to get beanName and changedMethodName.
+Extract beanType from change.before or change.after as above. Skip if unavailable.
+Iterate consumerManifest.consumes.beanInjections. For each injection:
+
+Skip unless injection.providerType === beanType.
+Iterate injection.calledMethods. For each calledMethod:
+
+Extract the method name from calledMethod.signature. The signature format is "methodName(...)" (e.g. "getById(...)"). Use a regex /^([A-Za-z_$][\w$]*)/ on the signature to capture the leading identifier.
+If the extracted method name equals changedMethodName (exact string match), emit:
+typescript{ change, injection, calledMethod }
+
+
+
+
+
+Do NOT emit a bare { change, injection, calledMethod: null } when method-level and no method matched — same precision rule as the DTO field case. Only emit when there's a concrete method-use match.
+
+
+
+
+
+Aggregation and return
+
+
+Return a flat array of all BeanMatch entries.
+No deduplication across changes.
+
+
+
+Error handling
+
+
+Neither method throws. Wrap the outer loop of each in try/catch. On unexpected exceptions during a single change's processing, log via console.warn with the change id and error message, then continue with the next change.
+Skipping a change silently on well-defined cases (additive kinds, missing type info) is normal flow — no warning needed.
+
+
+
+Do not
+
+
+Do not perform severity scoring. That's a separate module.
+Do not call the LLM.
+Do not normalize paths inline — always go through the imported normalizePath function.
+Do not mutate changes, consumerManifest, or any nested structures.
+Do not emit matches for _ADDED change kinds (additive changes have no consumer breakage).
+Do not emit fallback null-usedField or null-calledMethod matches for field-level or method-level changes. Precision requires a concrete match.
+Do not import from child_process, fs, or any I/O module.
+
+
+
+Expected behavior sketch
+
+Given a change:
+
+typescript{
+  id: 'c1',
+  kind: 'DTO_FIELD_REMOVED',
+  surfaceKind: 'dto',
+  surfaceId: 'com.example.cdu.dto.CustomerResponse.phone',
+  severity: 'breaking',
+  before: { name: 'phone', type: 'String' },
+  after: null,
+  riskFlags: []
+}
+
+And a consumer manifest whose consumes.httpCalls includes:
+
+typescript{
+  provider: 'cdu-service',
+  method: 'GET',
+  path: '/customer/{}',
+  responseType: 'CustomerResponse',
+  usedFields: [
+    { path: 'response.phone', confidence: 'declared' },
+    { path: 'response.name', confidence: 'declared' }
+  ],
+  file: 'PouService.java',
+  line: 47
+}
+
+matchHttp should return exactly one HttpMatch:
+
+typescript{
+  change: <the above change>,
+  callSite: <the above callSite>,
+  usedField: { path: 'response.phone', confidence: 'declared' }
+}
+
+If the changed field were unused instead, no match should be emitted — the consumer doesn't read unused.
+
+Complete the file. Write focused, testable code. Use small private helpers for the "extract bean type from change" and "extract method name from signature" operations. Keep the two match methods symmetric in structure.
